@@ -44,6 +44,54 @@ EOF
 After installing, just tell your agent to run `dev-browser --help` — the help output includes a full LLM usage guide with examples and API reference. No plugin or skill installation needed.
 
 <details>
+<summary>Allowing dev-browser in Claude Code without permission prompts</summary>
+
+By default, Claude Code asks for approval each time it runs a bash command. You can pre-approve `dev-browser` so it runs without permission checks by adding it to the `allow` list in your settings.
+
+**Per-project** — add to `.claude/settings.json` in your project root:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(dev-browser *)"
+    ]
+  }
+}
+```
+
+**Per-user (global)** — add to `~/.claude/settings.json`:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(dev-browser *)"
+    ]
+  }
+}
+```
+
+The pattern `Bash(dev-browser *)` matches any command starting with `dev-browser ` followed by arguments (e.g. `dev-browser --headless`, `dev-browser --connect`). This is safe because dev-browser scripts run in a sandboxed QuickJS WASM environment with no host filesystem or network access.
+
+You can also allow related commands in the same list:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(dev-browser *)",
+      "Bash(npx dev-browser *)"
+    ]
+  }
+}
+```
+
+> **Tip:** If you've already been prompted and clicked "Always allow", Claude Code adds the specific command pattern automatically. The settings file approach lets you pre-approve it before the first run.
+
+</details>
+
+<details>
 <summary>Legacy plugin installation (Claude Code / Amp / Codex)</summary>
 
 ### Claude Code
