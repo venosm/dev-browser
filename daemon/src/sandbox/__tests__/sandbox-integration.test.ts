@@ -165,7 +165,7 @@ describe.sequential("QuickJS sandbox integration", () => {
           timeout: 25,
         }
       )
-    ).rejects.toThrow(/timed out|terminated/i);
+    ).rejects.toThrow(/timed out|terminated|interrupted/i);
   }, 120_000);
 
   it("routes console output to stdout", async () => {
