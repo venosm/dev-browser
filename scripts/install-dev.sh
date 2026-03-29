@@ -4,13 +4,16 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 echo "==> Installing daemon dependencies..."
-cd "$REPO_DIR/daemon" && pnpm install
+cd "$REPO_DIR/daemon" && npx pnpm install
 
 echo "==> Bundling daemon..."
-cd "$REPO_DIR/daemon" && pnpm run bundle
+cd "$REPO_DIR/daemon" && npx pnpm run bundle && npx pnpm run bundle:sandbox-client
 
 echo "==> Installing dev-browser binary..."
 cargo install --path "$REPO_DIR/cli" --force
+
+# Make sure the just-installed binary is on PATH for the rest of this script
+export PATH="$HOME/.cargo/bin:$PATH"
 
 echo "==> Installing embedded daemon runtime..."
 dev-browser install

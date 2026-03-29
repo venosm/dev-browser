@@ -4,11 +4,17 @@ import util from "node:util";
 import type { Page } from "playwright";
 
 import type { BrowserManager } from "../browser-manager.js";
+import * as AuditManager from "../audit-manager.js";
+import * as ErrorCollector from "../error-collector.js";
+import { NetworkManager } from "../network-manager.js";
+import { generateTest } from "../recording-manager.js";
+import * as SessionManager from "../session-manager.js";
 import {
   ensureDevBrowserTempDir,
   readDevBrowserTempFile,
   writeDevBrowserTempFile,
 } from "../temp-files.js";
+import * as VisualDiffManager from "../visual-diff-manager.js";
 import { HostBridge } from "./host-bridge.js";
 import { QuickJSHost, type QuickJSConsoleLevel } from "./quickjs-host.js";
 
@@ -185,6 +191,7 @@ export class QuickJSSandbox {
   #asyncError?: Error;
   #host?: QuickJSHost;
   #hostBridge?: HostBridge;
+  #networkManager?: NetworkManager;
   #flushPromise?: Promise<void>;
   #disposed = false;
   #initialized = false;
@@ -213,6 +220,28 @@ export class QuickJSSandbox {
           saveScreenshot: (name, data) => this.#writeTempFile(name, data),
           writeFile: (name, data) => this.#writeTempFile(name, data),
           readFile: (name) => this.#readTempFile(name),
+          networkMock: (pattern, response) => this.#networkManager!.mock(pattern, response),
+          networkClearMocks: (pattern) => this.#networkManager!.clearMocks(pattern),
+          networkGetLog: (options) => this.#networkManager!.getLog(options) as unknown,
+          networkClearLog: () => this.#networkManager!.clearLog(),
+          screenshotSaveBaseline: (name, data) => VisualDiffManager.saveBaseline(name, data),
+          screenshotCompare: (name, data, options) =>
+            VisualDiffManager.compareWithBaseline(name, data, options) as unknown,
+          screenshotListBaselines: () => VisualDiffManager.listBaselines() as unknown,
+          screenshotUpdateBaseline: (name, data) => VisualDiffManager.saveBaseline(name, data),
+          recordingGenerateTest: (log, options) =>
+            generateTest(log, options) as unknown,
+          sessionSave: (name, options) => this.#sessionSave(name, options),
+          sessionRestore: (name, options) => this.#sessionRestore(name, options),
+          sessionList: (options) => SessionManager.listSessions(options),
+          sessionDelete: (name) => SessionManager.deleteSession(name),
+          sessionInspect: (name) => SessionManager.inspectSession(name),
+          errorsGet: (options) => ErrorCollector.getErrors(options as ErrorCollector.GetErrorsOptions) as unknown,
+          errorsClear: (pageName) => { ErrorCollector.clearErrors(typeof pageName === "string" ? pageName : undefined); },
+          errorsSummary: () => ErrorCollector.getSummary(),
+          auditAccessibility: (pageName, options) => this.#auditPage("accessibility", pageName, options),
+          auditPerformance: (pageName, options) => this.#auditPage("performance", pageName, options),
+          auditFull: (pageName, options) => this.#auditPage("full", pageName, options),
         },
         onConsole: (level, args) => {
           this.#routeConsole(level, args);
@@ -368,6 +397,7 @@ export class QuickJSSandbox {
           `Browser "${this.#options.browserName}" not found. It should have been created before script execution.`
         );
       }
+      this.#networkManager = new NetworkManager(browserEntry.context);
       this.#hostBridge = new HostBridge({
         sendToSandbox: (json) => {
           this.#transportInbox.push(json);
@@ -520,6 +550,468 @@ export class QuickJSSandbox {
                   writable: false,
                 },
               });
+
+              // --- network API ---
+              const networkApi = Object.create(null);
+              Object.defineProperties(networkApi, {
+                mock: {
+                  value: async (pattern, response) => {
+                    await hostCall("networkMock", JSON.stringify([pattern, response ?? {}]));
+                  },
+                  enumerable: true,
+                },
+                clearMocks: {
+                  value: async (pattern) => {
+                    await hostCall("networkClearMocks", JSON.stringify([pattern ?? null]));
+                  },
+                  enumerable: true,
+                },
+                getLog: {
+                  value: async (options) => {
+                    return await hostCall("networkGetLog", JSON.stringify([options ?? {}]));
+                  },
+                  enumerable: true,
+                },
+                clearLog: {
+                  value: async () => {
+                    await hostCall("networkClearLog", JSON.stringify([]));
+                  },
+                  enumerable: true,
+                },
+              });
+              Object.freeze(networkApi);
+              Object.defineProperty(globalThis, "network", {
+                value: networkApi,
+                configurable: false,
+                enumerable: true,
+                writable: false,
+              });
+
+              // --- screenshot API ---
+              const screenshotApi = Object.create(null);
+              Object.defineProperties(screenshotApi, {
+                baseline: {
+                  value: async (page, name, options) => {
+                    const opts = options || {};
+                    let buf;
+                    if (opts.element) {
+                      buf = await page.locator(opts.element).screenshot();
+                    } else {
+                      const screenshotOpts = {};
+                      if (opts.fullPage) screenshotOpts.fullPage = opts.fullPage;
+                      if (opts.clip) screenshotOpts.clip = opts.clip;
+                      buf = await page.screenshot(screenshotOpts);
+                    }
+                    return await hostCall(
+                      "screenshotSaveBaseline",
+                      JSON.stringify([name, encodeHostFilePayload(buf)]),
+                    );
+                  },
+                  enumerable: true,
+                },
+                compare: {
+                  value: async (page, name, options) => {
+                    const opts = options || {};
+                    let buf;
+                    if (opts.element) {
+                      buf = await page.locator(opts.element).screenshot();
+                    } else {
+                      const screenshotOpts = {};
+                      if (opts.fullPage) screenshotOpts.fullPage = opts.fullPage;
+                      if (opts.clip) screenshotOpts.clip = opts.clip;
+                      buf = await page.screenshot(screenshotOpts);
+                    }
+                    return await hostCall(
+                      "screenshotCompare",
+                      JSON.stringify([name, encodeHostFilePayload(buf), opts]),
+                    );
+                  },
+                  enumerable: true,
+                },
+                updateBaseline: {
+                  value: async (page, name, options) => {
+                    const opts = options || {};
+                    let buf;
+                    if (opts.element) {
+                      buf = await page.locator(opts.element).screenshot();
+                    } else {
+                      const screenshotOpts = {};
+                      if (opts.fullPage) screenshotOpts.fullPage = opts.fullPage;
+                      if (opts.clip) screenshotOpts.clip = opts.clip;
+                      buf = await page.screenshot(screenshotOpts);
+                    }
+                    return await hostCall(
+                      "screenshotUpdateBaseline",
+                      JSON.stringify([name, encodeHostFilePayload(buf)]),
+                    );
+                  },
+                  enumerable: true,
+                },
+                listBaselines: {
+                  value: async () => {
+                    return await hostCall("screenshotListBaselines", JSON.stringify([]));
+                  },
+                  enumerable: true,
+                },
+              });
+              Object.freeze(screenshotApi);
+              Object.defineProperty(globalThis, "screenshot", {
+                value: screenshotApi,
+                configurable: false,
+                enumerable: true,
+                writable: false,
+              });
+
+              // --- recording API ---
+              const recordingApi = (() => {
+                let recordingLog = null;
+                let recordingOptions = {};
+                const recordingStart = Date.now();
+
+                const LOCATOR_CHAIN_METHODS = new Set([
+                  "getByRole", "getByLabel", "getByText", "getByTestId",
+                  "getByPlaceholder", "getByAltText", "getByTitle",
+                  "locator", "filter", "nth", "first", "last",
+                ]);
+                const LOCATOR_ACTION_METHODS = new Set([
+                  "click", "fill", "type", "press", "check", "uncheck",
+                  "selectOption", "hover", "focus", "blur", "tap", "dblclick",
+                  "waitFor", "textContent", "innerText", "inputValue", "getAttribute",
+                ]);
+                const PAGE_ACTION_METHODS = new Set([
+                  "goto", "click", "fill", "type", "press", "check", "uncheck",
+                  "selectOption", "hover", "focus", "blur", "tap", "dblclick",
+                  "reload", "goBack", "goForward", "waitForNavigation", "waitForURL",
+                  "evaluate", "screenshot",
+                ]);
+
+                function serializeArg(arg) {
+                  if (arg === null || arg === undefined) return arg;
+                  if (typeof arg === "string" || typeof arg === "number" || typeof arg === "boolean") return arg;
+                  if (typeof arg === "function") return "[function]";
+                  if (typeof arg === "object") {
+                    if (arg instanceof Uint8Array || arg instanceof ArrayBuffer) return "[binary]";
+                    try {
+                      const out = {};
+                      for (const k of Object.keys(arg)) {
+                        out[k] = serializeArg(arg[k]);
+                      }
+                      return out;
+                    } catch { return String(arg); }
+                  }
+                  return String(arg);
+                }
+
+                function wrapLocator(locator, chain) {
+                  return new Proxy(locator, {
+                    get(target, prop) {
+                      if (typeof prop !== "string") return target[prop];
+                      const val = target[prop];
+                      if (typeof val !== "function") return val;
+                      if (LOCATOR_CHAIN_METHODS.has(prop)) {
+                        return (...args) => {
+                          const child = val.apply(target, args);
+                          return wrapLocator(child, [...chain, { method: prop, args: args.map(serializeArg) }]);
+                        };
+                      }
+                      if (LOCATOR_ACTION_METHODS.has(prop)) {
+                        return async (...args) => {
+                          if (recordingLog !== null) {
+                            recordingLog.push({
+                              kind: "locator-action",
+                              chain,
+                              action: prop,
+                              args: args.map(serializeArg),
+                              timestamp: Date.now() - recordingStart,
+                            });
+                          }
+                          return val.apply(target, args);
+                        };
+                      }
+                      return val.bind(target);
+                    },
+                  });
+                }
+
+                function wrapPage(page) {
+                  return new Proxy(page, {
+                    get(target, prop) {
+                      if (typeof prop !== "string") return target[prop];
+                      const val = target[prop];
+                      if (typeof val !== "function") return val;
+                      if (LOCATOR_CHAIN_METHODS.has(prop)) {
+                        return (...args) => {
+                          const locator = val.apply(target, args);
+                          return wrapLocator(locator, [{ method: prop, args: args.map(serializeArg) }]);
+                        };
+                      }
+                      if (PAGE_ACTION_METHODS.has(prop)) {
+                        return async (...args) => {
+                          if (recordingLog !== null) {
+                            recordingLog.push({
+                              kind: "page-action",
+                              action: prop,
+                              args: args.map(serializeArg),
+                              timestamp: Date.now() - recordingStart,
+                            });
+                          }
+                          return val.apply(target, args);
+                        };
+                      }
+                      return val.bind(target);
+                    },
+                  });
+                }
+
+                return Object.freeze(Object.create(null, {
+                  start: {
+                    value: (options) => {
+                      recordingLog = [];
+                      recordingOptions = options || {};
+                    },
+                    enumerable: true,
+                  },
+                  wrap: {
+                    value: (page) => {
+                      if (recordingLog === null) {
+                        throw new Error("Call recording.start() before recording.wrap()");
+                      }
+                      return wrapPage(page);
+                    },
+                    enumerable: true,
+                  },
+                  checkpoint: {
+                    value: async (description, page) => {
+                      if (recordingLog === null) {
+                        throw new Error("Recording not started. Call recording.start() first.");
+                      }
+                      const url = page ? page.url() : "";
+                      let title = "";
+                      try { title = page ? await page.title() : ""; } catch {}
+                      recordingLog.push({
+                        kind: "checkpoint",
+                        description: String(description || ""),
+                        url,
+                        title,
+                        timestamp: Date.now() - recordingStart,
+                      });
+                    },
+                    enumerable: true,
+                  },
+                  stop: {
+                    value: async () => {
+                      if (recordingLog === null) {
+                        throw new Error("Recording not started. Call recording.start() first.");
+                      }
+                      const currentLog = recordingLog;
+                      const currentOptions = recordingOptions;
+                      recordingLog = null;
+                      recordingOptions = {};
+                      return await hostCall(
+                        "recordingGenerateTest",
+                        JSON.stringify([currentLog, currentOptions]),
+                      );
+                    },
+                    enumerable: true,
+                  },
+                }));
+              })();
+              Object.defineProperty(globalThis, "recording", {
+                value: recordingApi,
+                configurable: false,
+                enumerable: true,
+                writable: false,
+              });
+
+              // --- session API ---
+              const sessionApi = Object.create(null);
+              Object.defineProperties(sessionApi, {
+                save: {
+                  value: async (name, options) => {
+                    return await hostCall("sessionSave", JSON.stringify([name, options ?? {}]));
+                  },
+                  enumerable: true,
+                },
+                restore: {
+                  value: async (name, options) => {
+                    return await hostCall("sessionRestore", JSON.stringify([name, options ?? {}]));
+                  },
+                  enumerable: true,
+                },
+                list: {
+                  value: async (options) => {
+                    return await hostCall("sessionList", JSON.stringify([options ?? {}]));
+                  },
+                  enumerable: true,
+                },
+                delete: {
+                  value: async (name) => {
+                    return await hostCall("sessionDelete", JSON.stringify([name]));
+                  },
+                  enumerable: true,
+                },
+                inspect: {
+                  value: async (name) => {
+                    return await hostCall("sessionInspect", JSON.stringify([name]));
+                  },
+                  enumerable: true,
+                },
+              });
+              Object.freeze(sessionApi);
+              Object.defineProperty(globalThis, "session", {
+                value: sessionApi,
+                configurable: false,
+                enumerable: true,
+                writable: false,
+              });
+
+              // --- errors API ---
+              const errorsApi = Object.freeze(Object.create(null, {
+                get: {
+                  value: async (options) => {
+                    return await hostCall("errorsGet", JSON.stringify([options ?? {}]));
+                  },
+                  enumerable: true,
+                },
+                clear: {
+                  value: async (pageName) => {
+                    await hostCall("errorsClear", JSON.stringify([pageName ?? null]));
+                  },
+                  enumerable: true,
+                },
+                summary: {
+                  value: async () => {
+                    return await hostCall("errorsSummary", JSON.stringify([]));
+                  },
+                  enumerable: true,
+                },
+              }));
+              Object.defineProperty(globalThis, "errors", {
+                value: errorsApi,
+                configurable: false,
+                enumerable: true,
+                writable: false,
+              });
+
+              // --- audit API ---
+              const auditApi = Object.freeze(Object.create(null, {
+                accessibility: {
+                  value: async (pageName, options) => {
+                    return await hostCall("auditAccessibility", JSON.stringify([pageName, options ?? {}]));
+                  },
+                  enumerable: true,
+                },
+                performance: {
+                  value: async (pageName, options) => {
+                    return await hostCall("auditPerformance", JSON.stringify([pageName, options ?? {}]));
+                  },
+                  enumerable: true,
+                },
+                full: {
+                  value: async (pageName, options) => {
+                    return await hostCall("auditFull", JSON.stringify([pageName, options ?? {}]));
+                  },
+                  enumerable: true,
+                },
+              }));
+              Object.defineProperty(globalThis, "audit", {
+                value: auditApi,
+                configurable: false,
+                enumerable: true,
+                writable: false,
+              });
+
+              // --- scenario API (pure-sandbox orchestration helpers) ---
+              const scenarioApi = (() => {
+                function parallel(fns) {
+                  if (!Array.isArray(fns) || fns.length === 0) {
+                    return Promise.resolve([]);
+                  }
+                  return Promise.all(fns.map((fn, i) => {
+                    if (typeof fn !== "function") {
+                      return Promise.reject(new TypeError(\`scenario.parallel: item \${i} is not a function\`));
+                    }
+                    return Promise.resolve().then(() => fn());
+                  }));
+                }
+
+                function race(fns) {
+                  if (!Array.isArray(fns) || fns.length === 0) {
+                    return Promise.reject(new Error("scenario.race: need at least one function"));
+                  }
+                  return Promise.race(fns.map((fn, i) => {
+                    if (typeof fn !== "function") {
+                      return Promise.reject(new TypeError(\`scenario.race: item \${i} is not a function\`));
+                    }
+                    return Promise.resolve().then(() => fn());
+                  }));
+                }
+
+                function barrier(count) {
+                  const n = count | 0;
+                  if (n < 1) throw new RangeError("barrier count must be >= 1");
+                  let arrived = 0;
+                  let waiters = [];
+                  let released = false;
+                  return Object.freeze({
+                    signal() {
+                      arrived++;
+                      if (arrived >= n && !released) {
+                        released = true;
+                        const w = waiters.splice(0);
+                        for (const resolve of w) resolve();
+                      }
+                    },
+                    wait() {
+                      if (released) return Promise.resolve();
+                      return new Promise((resolve) => { waiters.push(resolve); });
+                    },
+                    get arrived() { return arrived; },
+                    get needed() { return n; },
+                  });
+                }
+
+                function observe(page, fn) {
+                  if (typeof fn !== "function") {
+                    throw new TypeError("scenario.observe: second argument must be a function");
+                  }
+                  const events = [];
+                  const ts = () => Date.now();
+
+                  const onResponse = (resp) => {
+                    events.push({ type: "response", url: resp.url(), status: resp.status(), timestamp: ts() });
+                  };
+                  const onConsole = (msg) => {
+                    if (msg.type() === "error" || msg.type() === "warning") {
+                      events.push({ type: "console", level: msg.type(), text: msg.text(), timestamp: ts() });
+                    }
+                  };
+
+                  page.on("response", onResponse);
+                  page.on("console", onConsole);
+
+                  return Promise.resolve()
+                    .then(() => fn(page))
+                    .finally(() => {
+                      try { page.off("response", onResponse); } catch {}
+                      try { page.off("console", onConsole); } catch {}
+                    })
+                    .then((result) => ({ result, events }));
+                }
+
+                return Object.freeze(Object.create(null, {
+                  parallel: { value: parallel, enumerable: true },
+                  race: { value: race, enumerable: true },
+                  barrier: { value: barrier, enumerable: true },
+                  observe: { value: observe, enumerable: true },
+                }));
+              })();
+              Object.defineProperty(globalThis, "scenario", {
+                value: scenarioApi,
+                configurable: false,
+                enumerable: true,
+                writable: false,
+              });
             })();
           })()
         `,
@@ -581,6 +1073,14 @@ export class QuickJSSandbox {
 
     this.#transportInbox.length = 0;
     this.#pendingHostOperations.clear();
+
+    try {
+      await this.#networkManager?.dispose();
+    } catch {
+      // Best effort cleanup during sandbox teardown.
+    } finally {
+      this.#networkManager = undefined;
+    }
 
     try {
       await this.#hostBridge?.dispose();
@@ -667,10 +1167,9 @@ export class QuickJSSandbox {
   }
 
   async #getPage(name: unknown): Promise<string> {
-    const page = await this.#options.manager.getPage(
-      this.#options.browserName,
-      requireString(name, "Page name or targetId")
-    );
+    const pageName = requireString(name, "Page name or targetId");
+    const page = await this.#options.manager.getPage(this.#options.browserName, pageName);
+    ErrorCollector.attachToPage(pageName, page);
     return extractGuid(page);
   }
 
@@ -699,6 +1198,38 @@ export class QuickJSSandbox {
 
   async #readTempFile(name: unknown): Promise<string> {
     return await readDevBrowserTempFile(requireString(name, "File name"));
+  }
+
+  async #sessionSave(name: unknown, options: unknown): Promise<unknown> {
+    const entry = this.#options.manager.getBrowser(this.#options.browserName);
+    if (!entry) {
+      throw new Error(`Browser "${this.#options.browserName}" not found`);
+    }
+    return await SessionManager.saveSession(entry.context, entry.pages, name, options);
+  }
+
+  async #sessionRestore(name: unknown, options: unknown): Promise<unknown> {
+    const entry = this.#options.manager.getBrowser(this.#options.browserName);
+    if (!entry) {
+      throw new Error(`Browser "${this.#options.browserName}" not found`);
+    }
+    return await SessionManager.restoreSession(entry.context, entry.pages, name, options);
+  }
+
+  async #auditPage(
+    kind: "accessibility" | "performance" | "full",
+    pageName: unknown,
+    options: unknown
+  ): Promise<unknown> {
+    const name = requireString(pageName, "Page name for audit");
+    const entry = this.#options.manager.getBrowser(this.#options.browserName);
+    if (!entry) throw new Error(`Browser "${this.#options.browserName}" not found`);
+    const page = entry.pages.get(name);
+    if (!page) throw new Error(`No named page "${name}" — call browser.getPage("${name}") first`);
+    const opts = (options && typeof options === "object" ? options : {}) as Record<string, unknown>;
+    if (kind === "accessibility") return await AuditManager.auditAccessibility(page, opts);
+    if (kind === "performance") return await AuditManager.auditPerformance(page, opts);
+    return await AuditManager.auditFull(page, opts);
   }
 
   async #cleanupAnonymousPages(options: { suppressErrors?: boolean } = {}): Promise<void> {

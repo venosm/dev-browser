@@ -108,6 +108,127 @@ LLM USAGE GUIDE:
 
     Or visit chrome://inspect/#remote-debugging to configure.
 
+  Network mocking (network global):
+    dev-browser <<'EOF'
+    // Mock an API endpoint to return specific data
+    await network.mock("/api/users", { body: [], status: 200 });
+    // Mock with simulated latency (tests loading states)
+    await network.mock("/api/feed", { delay: 3000, body: { items: [] } });
+    // Mock only the first N requests, then pass through
+    await network.mock("/api/flags", { body: { darkMode: true }, times: 1 });
+    const page = await browser.getPage("main");
+    await page.goto("http://localhost:3000");
+    // Clear specific mock or all mocks
+    await network.clearMocks("/api/users");
+    await network.clearMocks();
+    // Inspect request log
+    const log = await network.getLog({ mockedOnly: false, failedOnly: false });
+    console.log(JSON.stringify(log.slice(0, 5), null, 2));
+    await network.clearLog();
+    EOF
+
+  Visual diff / screenshot regression (screenshot global):
+    dev-browser <<'EOF'
+    const page = await browser.getPage("main");
+    await page.goto("http://localhost:3000");
+    // Save a baseline (first time, or after intentional UI changes)
+    await screenshot.baseline(page, "homepage");
+    // Compare against the saved baseline
+    const result = await screenshot.compare(page, "homepage", { threshold: 0.01 });
+    console.log(JSON.stringify({ match: result.match, summary: result.summary }, null, 2));
+    // Capture only a specific element
+    await screenshot.baseline(page, "hero", { element: ".hero-section" });
+    // List all saved baselines
+    const baselines = await screenshot.listBaselines();
+    console.log(JSON.stringify(baselines.map(b => b.name)));
+    // Update a baseline after an intentional design change
+    await screenshot.updateBaseline(page, "homepage");
+    EOF
+    // Baselines stored in ~/.dev-browser/baselines/
+    // Diff images stored in ~/.dev-browser/diffs/
+
+  Test recording — generate Playwright tests from agent actions (recording global):
+    dev-browser <<'EOF'
+    recording.start({ testName: "User signup flow", outputFile: "signup.spec.ts" });
+    const page = await browser.getPage("main");
+    // Wrap the page to capture all interactions
+    const rPage = recording.wrap(page);
+    await rPage.goto("http://localhost:3000/signup");
+    await rPage.getByLabel("Email").fill("test@example.com");
+    await rPage.getByLabel("Password").fill("SecurePass123");
+    await rPage.getByRole("button", { name: "Create Account" }).click();
+    await rPage.waitForURL("**/dashboard");
+    // Add assertion checkpoints
+    await recording.checkpoint("Redirected to dashboard after signup", rPage);
+    // Stop recording and get the generated test
+    const result = await recording.stop();
+    console.log(result.code);
+    console.log(JSON.stringify(result.stats));
+    // result.filePath points to the saved .spec.ts in ~/.dev-browser/tmp/
+    EOF
+
+  Session persistence — save and restore login state (session global):
+    // SESSION SAVE: after successful login, preserve auth state for future runs
+    dev-browser <<'EOF'
+    const page = await browser.getPage("main");
+    await page.goto("http://localhost:3000/login");
+    await page.fill('[name="email"]', "admin@example.com");
+    await page.fill('[name="password"]', "password123");
+    await page.click('button[type="submit"]');
+    await page.waitForURL("**/dashboard");
+    const result = await session.save("admin", {
+      description: "Admin user — full access",
+      tags: ["admin"],
+    });
+    console.log(JSON.stringify(result, null, 2));
+    // result: { name, path, cookieCount, localStorageEntries, authType, estimatedExpiry }
+    EOF
+
+    // SESSION RESTORE: skip login entirely in future scripts
+    dev-browser <<'EOF'
+    const result = await session.restore("admin");
+    if (result.expired) {
+      console.log("Session expired:", result.recommendation);
+    } else {
+      const page = await browser.getPage("main");
+      await page.goto("http://localhost:3000/dashboard");
+      console.log("Loaded as authenticated user:", await page.title());
+    }
+    EOF
+
+    // SESSION LIST: see what sessions are saved
+    dev-browser <<'EOF'
+    const sessions = await session.list({ checkExpiry: true });
+    console.log(JSON.stringify(sessions, null, 2));
+    EOF
+
+    // SESSION INSPECT: examine stored tokens/cookies without restoring
+    dev-browser <<'EOF'
+    const info = await session.inspect("admin");
+    console.log(JSON.stringify(info.summary, null, 2));
+    // summary includes: authCookies, jwtTokens (with expiry), expired, expiryDetails
+    EOF
+
+    // SESSION DELETE: remove a saved session
+    dev-browser <<'EOF'
+    await session.delete("old-session");
+    EOF
+
+    // MULTI-ROLE TESTING: save sessions for different user roles
+    dev-browser <<'EOF'
+    // After logging in as admin:
+    await session.save("role-admin", { tags: ["role-test"] });
+    // After logging in as editor:
+    await session.save("role-editor", { tags: ["role-test"] });
+    // Test: editor can't delete
+    await session.restore("role-editor");
+    const page = await browser.getPage("app");
+    await page.goto("http://localhost:3000/articles/1");
+    const deleteBtn = page.getByRole("button", { name: "Delete" });
+    console.log("Delete visible:", await deleteBtn.isVisible());
+    EOF
+    // Sessions stored in ~/.dev-browser/sessions/
+
   Tips:
     - Use console.log(JSON.stringify(...)) for structured output.
     - Prefer page.snapshotForAI() for structure; use screenshots when visual layout or styling matters.
@@ -116,3 +237,94 @@ LLM USAGE GUIDE:
     - Use --connect to attach to an existing browser; omit the URL to auto-discover Chrome with debugging enabled.
     - Use short timeouts (--timeout 10) so scripts fail fast instead of hanging on missing elements.
     - Add --headless for unattended automation; omit it when you want to watch the browser window.
+    - Use network.mock() before page.goto() to ensure mocks are in place before the page loads.
+    - Use screenshot.baseline() once, then screenshot.compare() on every subsequent run to detect regressions.
+    - Use recording.wrap(page) instead of the plain page for all interactions you want captured.
+    - Use session.save() after completing a login flow; use session.restore() at the start of future scripts to skip login.
+    - Always check result.expired after session.restore() — re-login and re-save if expired.
+    - session.restore() restores cookies + localStorage immediately; sessionStorage requires an open page on the correct origin.
+    - Use session.inspect() to understand what tokens/cookies are stored before deciding whether to re-use or refresh a session.
+    - errors.get() is populated automatically — every browser.getPage() call attaches error listeners.
+    - Call errors.summary() after any complex interaction to get a human-readable error digest.
+    - Pass page NAMES (strings) to audit.accessibility() and audit.performance(), not page objects.
+    - Call audit.accessibility() after page.waitForLoadState("networkidle") for accurate results.
+    - scenario.parallel() and scenario.race() accept arrays of async functions, not arrays of pages.
+    - Use scenario.observe(page, fn) to capture all HTTP responses during a navigation flow.
+
+  Error aggregation (errors global — auto-attached per page):
+    dev-browser <<'EOF'
+    const page = await browser.getPage("main");
+    await page.goto("http://localhost:3000");
+    // errors are collected automatically — no setup needed
+    const report = await errors.get();
+    console.log(JSON.stringify({ summary: report.summary, diagnostics: report.diagnostics }, null, 2));
+    // Or get a one-liner for LLM context
+    const text = await errors.summary();
+    console.log(text);
+    // Filter to a specific page or type
+    const netErrors = await errors.get({ types: ["network-failure", "cors-error"], limit: 10 });
+    console.log(JSON.stringify(netErrors.entries, null, 2));
+    // Clear before a fresh interaction
+    await errors.clear();
+    EOF
+
+  Accessibility audit (audit global — uses axe-core):
+    dev-browser <<'EOF'
+    const page = await browser.getPage("main");
+    await page.goto("http://localhost:3000");
+    await page.waitForLoadState("networkidle");
+    const report = await audit.accessibility("main");
+    console.log(JSON.stringify({ score: report.score, summary: report.summary }, null, 2));
+    // Detailed violations
+    for (const v of report.violations) {
+      console.log(v.impact, v.help, v.helpUrl);
+    }
+    EOF
+
+  Performance audit (audit global — Core Web Vitals):
+    dev-browser <<'EOF'
+    const page = await browser.getPage("main");
+    await page.goto("http://localhost:3000");
+    await page.waitForLoadState("networkidle");
+    const perf = await audit.performance("main", { settleMs: 500 });
+    console.log(perf.summary);
+    console.log(JSON.stringify(perf.ratings, null, 2));
+    EOF
+
+  Full audit (accessibility + performance combined):
+    dev-browser <<'EOF'
+    const page = await browser.getPage("main");
+    await page.goto("http://localhost:3000");
+    await page.waitForLoadState("networkidle");
+    const full = await audit.full("main");
+    console.log(full.summary);
+    EOF
+
+  Multi-page orchestration (scenario global):
+    dev-browser <<'EOF'
+    // Run two navigations in parallel
+    const [titleA, titleB] = await scenario.parallel([
+      async () => {
+        const p = await browser.getPage("tab-a");
+        await p.goto("https://example.com");
+        return await p.title();
+      },
+      async () => {
+        const p = await browser.getPage("tab-b");
+        await p.goto("https://example.org");
+        return await p.title();
+      },
+    ]);
+    console.log(titleA, titleB);
+
+    // Observe a page during a flow
+    const page = await browser.getPage("main");
+    const { result, events } = await scenario.observe(page, async (p) => {
+      await p.goto("http://localhost:3000/api-demo");
+      await p.getByRole("button", { name: "Load" }).click();
+      await p.waitForLoadState("networkidle");
+      return await p.title();
+    });
+    const apiCalls = events.filter(e => e.type === "response" && e.url.includes("/api/"));
+    console.log(JSON.stringify({ result, apiCalls }, null, 2));
+    EOF

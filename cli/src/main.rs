@@ -39,6 +39,13 @@ SANDBOX ENVIRONMENT:
     saveScreenshot(buf, name)  Save a screenshot buffer (async, must be awaited)
     writeFile(name, data)      Write a file to temp dir (async, must be awaited)
     readFile(name)             Read a file from temp dir (async, must be awaited)
+    network                    Mock/intercept network requests; log request traffic
+    screenshot                 Save/compare visual baselines for regression testing
+    recording                  Record page interactions and generate Playwright tests
+    session                    Save/restore browser session state (cookies, localStorage, sessionStorage)
+    errors                     Collect console errors, JS exceptions, and network failures per page
+    audit                      Accessibility (axe-core) and performance (Core Web Vitals) audits
+    scenario                   Orchestrate multiple pages: parallel, race, barrier, observe
 
   Memory and CPU limits are enforced. Infinite loops will be interrupted.
 
