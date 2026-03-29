@@ -101,7 +101,7 @@ Page objects — you get the same API (goto, click, fill, locator, evaluate, etc
 
 const CLI_AFTER_LONG_HELP: &str = include_str!("../llm-guide.txt");
 
-const DEFAULT_SCRIPT_TIMEOUT_SECS: u32 = 30;
+const DEFAULT_SCRIPT_TIMEOUT_SECS: u32 = 120;
 
 #[derive(Parser)]
 #[command(name = "dev-browser")]
