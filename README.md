@@ -67,7 +67,7 @@ Installs the skill to both `~/.codex/skills/dev-browser/` and `~/.agents/skills/
 ### From source (development)
 
 ```bash
-git clone https://github.com/SawyerHood/dev-browser
+git clone https://github.com/venosm/dev-browser
 cd dev-browser
 bash scripts/install-dev.sh
 ```
@@ -586,6 +586,8 @@ _See [dev-browser-eval](https://github.com/SawyerHood/dev-browser-eval) for meth
 
 MIT
 
-## Author
+## Authors
 
-[Sawyer Hood](https://github.com/sawyerhood)
+**Fork maintained by [Milan Venos](https://github.com/venosm)** — added Test Recording & Replay, Visual Regression, Network Mocking, Multi-page Orchestration, Console & Network Error Aggregation, Session Persistence, and Accessibility & Performance Audit.
+
+Original project by [Sawyer Hood](https://github.com/sawyerhood) — [SawyerHood/dev-browser](https://github.com/SawyerHood/dev-browser).
