@@ -14,6 +14,7 @@ export interface NetworkLogEntry {
   method: string;
   status: number;
   mocked: boolean;
+  intercepted?: boolean;
   duration: number;
   timestamp: number;
   resourceType: string;
@@ -28,9 +29,24 @@ interface MockEntry {
   timesLeft: number;
 }
 
+interface InterceptEntry {
+  handler: (route: Route, request: Request) => Promise<void>;
+}
+
+interface InterceptModifications {
+  headers?: Record<string, string>;
+  removeHeaders?: string[];
+  method?: string;
+  url?: string;
+  postData?: string;
+}
+
+const MAX_LOG_ENTRIES = 5_000;
+
 export class NetworkManager {
   readonly #context: BrowserContext;
   readonly #mocks = new Map<string, MockEntry>();
+  readonly #intercepts = new Map<string, InterceptEntry>();
   readonly #log: NetworkLogEntry[] = [];
   readonly #pendingRequests = new Map<Request, number>();
   #requestListener?: (request: Request) => void;
@@ -163,6 +179,10 @@ export class NetworkManager {
         requestBody: request.postData() ?? undefined,
         responseBody,
       });
+
+      if (this.#log.length > MAX_LOG_ENTRIES) {
+        this.#log.splice(0, this.#log.length - MAX_LOG_ENTRIES);
+      }
     };
 
     this.#context.on("request", this.#requestListener);
@@ -219,8 +239,216 @@ export class NetworkManager {
     this.#log.length = 0;
   }
 
+  getLogEntry(index: unknown): NetworkLogEntry {
+    const idx = typeof index === "number" ? index : Number(index);
+    if (!Number.isInteger(idx) || idx < 0 || idx >= this.#log.length) {
+      throw new Error(`Invalid log entry index: ${index} (log has ${this.#log.length} entries)`);
+    }
+    return this.#log[idx]!;
+  }
+
+  getLogLength(): number {
+    return this.#log.length;
+  }
+
+  async intercept(pattern: unknown, modifications: unknown): Promise<void> {
+    const patternStr = String(pattern);
+    const mods = ((modifications ?? {}) as InterceptModifications);
+
+    const existing = this.#intercepts.get(patternStr);
+    if (existing) {
+      try {
+        await this.#context.unroute(patternStr, existing.handler);
+      } catch {
+        // Best effort
+      }
+    }
+
+    const entry: InterceptEntry = {
+      handler: async (route: Route, request: Request) => {
+        const overrides: Record<string, unknown> = {};
+
+        if (mods.method) {
+          overrides.method = mods.method;
+        }
+        if (mods.url) {
+          overrides.url = mods.url;
+        }
+        if (mods.postData) {
+          overrides.postData = mods.postData;
+        }
+
+        if (mods.headers || mods.removeHeaders) {
+          const currentHeaders = { ...request.headers() };
+          if (mods.removeHeaders) {
+            for (const name of mods.removeHeaders) {
+              delete currentHeaders[name.toLowerCase()];
+            }
+          }
+          if (mods.headers) {
+            for (const [name, value] of Object.entries(mods.headers)) {
+              currentHeaders[name.toLowerCase()] = value;
+            }
+          }
+          overrides.headers = currentHeaders;
+        }
+
+        await route.continue(overrides);
+      },
+    };
+
+    this.#intercepts.set(patternStr, entry);
+    await this.#context.route(patternStr, entry.handler);
+  }
+
+  async clearIntercepts(pattern?: unknown): Promise<void> {
+    if (pattern !== null && pattern !== undefined) {
+      const patternStr = String(pattern);
+      const entry = this.#intercepts.get(patternStr);
+      if (entry) {
+        try {
+          await this.#context.unroute(patternStr, entry.handler);
+        } catch {
+          // Best effort
+        }
+        this.#intercepts.delete(patternStr);
+      }
+    } else {
+      const entries = [...this.#intercepts.entries()];
+      for (const [pat, entry] of entries) {
+        try {
+          await this.#context.unroute(pat, entry.handler);
+        } catch {
+          // Best effort
+        }
+      }
+      this.#intercepts.clear();
+    }
+  }
+
+  exportHar(): unknown {
+    const entries = this.#log.map((entry) => ({
+      startedDateTime: new Date(entry.timestamp).toISOString(),
+      time: entry.duration,
+      request: {
+        method: entry.method,
+        url: entry.url,
+        httpVersion: "HTTP/1.1",
+        headers: Object.entries(entry.requestHeaders).map(([name, value]) => ({ name, value })),
+        queryString: this.#parseQueryString(entry.url),
+        postData: entry.requestBody
+          ? { mimeType: entry.requestHeaders["content-type"] ?? "application/octet-stream", text: entry.requestBody }
+          : undefined,
+        headersSize: -1,
+        bodySize: entry.requestBody ? entry.requestBody.length : 0,
+        cookies: [],
+      },
+      response: {
+        status: entry.status,
+        statusText: "",
+        httpVersion: "HTTP/1.1",
+        headers: Object.entries(entry.responseHeaders).map(([name, value]) => ({ name, value })),
+        content: {
+          size: entry.responseBody ? entry.responseBody.length : 0,
+          mimeType: entry.responseHeaders["content-type"] ?? "application/octet-stream",
+          text: entry.responseBody ?? "",
+        },
+        redirectURL: entry.responseHeaders["location"] ?? "",
+        headersSize: -1,
+        bodySize: entry.responseBody ? entry.responseBody.length : -1,
+        cookies: [],
+      },
+      cache: {},
+      timings: {
+        send: 0,
+        wait: entry.duration,
+        receive: 0,
+      },
+    }));
+
+    return {
+      log: {
+        version: "1.2",
+        creator: { name: "dev-browser", version: "0.2.4" },
+        entries,
+      },
+    };
+  }
+
+  importHar(har: unknown): void {
+    if (typeof har !== "object" || har === null) {
+      throw new TypeError("HAR data must be an object");
+    }
+
+    const log = (har as { log?: unknown }).log;
+    if (typeof log !== "object" || log === null) {
+      throw new TypeError("HAR data must contain a log object");
+    }
+
+    const entries = (log as { entries?: unknown }).entries;
+    if (!Array.isArray(entries)) {
+      throw new TypeError("HAR log must contain an entries array");
+    }
+
+    for (const entry of entries) {
+      if (typeof entry !== "object" || entry === null) continue;
+      const req = (entry as { request?: Record<string, unknown> }).request;
+      const res = (entry as { response?: Record<string, unknown> }).response;
+      if (!req || !res) continue;
+
+      const reqHeaders: Record<string, string> = {};
+      if (Array.isArray(req.headers)) {
+        for (const h of req.headers as Array<{ name?: string; value?: string }>) {
+          if (h.name && h.value) reqHeaders[h.name.toLowerCase()] = h.value;
+        }
+      }
+
+      const resHeaders: Record<string, string> = {};
+      if (Array.isArray(res.headers)) {
+        for (const h of res.headers as Array<{ name?: string; value?: string }>) {
+          if (h.name && h.value) resHeaders[h.name.toLowerCase()] = h.value;
+        }
+      }
+
+      const content = res.content as { text?: string } | undefined;
+      const postData = req.postData as { text?: string } | undefined;
+
+      this.#log.push({
+        url: String(req.url ?? ""),
+        method: String(req.method ?? "GET"),
+        status: typeof res.status === "number" ? res.status : 0,
+        mocked: false,
+        duration: typeof (entry as { time?: number }).time === "number" ? (entry as { time: number }).time : 0,
+        timestamp: new Date(String((entry as { startedDateTime?: string }).startedDateTime ?? "")).getTime() || Date.now(),
+        resourceType: "other",
+        requestHeaders: reqHeaders,
+        responseHeaders: resHeaders,
+        requestBody: postData?.text,
+        responseBody: content?.text,
+      });
+    }
+
+    if (this.#log.length > MAX_LOG_ENTRIES) {
+      this.#log.splice(0, this.#log.length - MAX_LOG_ENTRIES);
+    }
+  }
+
+  #parseQueryString(url: string): Array<{ name: string; value: string }> {
+    try {
+      const parsed = new URL(url);
+      const result: Array<{ name: string; value: string }> = [];
+      parsed.searchParams.forEach((value, name) => {
+        result.push({ name, value });
+      });
+      return result;
+    } catch {
+      return [];
+    }
+  }
+
   async dispose(): Promise<void> {
     await this.clearMocks();
+    await this.clearIntercepts();
     if (this.#requestListener) {
       this.#context.off("request", this.#requestListener);
       this.#requestListener = undefined;

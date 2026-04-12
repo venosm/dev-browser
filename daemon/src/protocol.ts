@@ -11,6 +11,7 @@ const ExecuteRequestSchema = RequestBaseSchema.extend({
   headless: z.boolean().optional(),
   ignoreHTTPSErrors: z.boolean().optional(),
   connect: z.string().min(1).optional(),
+  proxy: z.string().min(1).optional(),
   timeoutMs: z.number().int().positive().optional(),
 });
 

@@ -19,8 +19,10 @@ const EMBEDDED_PACKAGE_JSON: &str = r#"{
   "private": true,
   "type": "module",
   "dependencies": {
+    "pixelmatch": "^7.1.0",
     "playwright": "^1.52.0",
     "playwright-core": "^1.52.0",
+    "pngjs": "^7.0.0",
     "quickjs-emscripten": "^0.32.0"
   }
 }"#;

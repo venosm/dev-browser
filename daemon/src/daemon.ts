@@ -26,8 +26,10 @@ const EMBEDDED_PACKAGE_JSON = JSON.stringify({
   private: true,
   type: "module",
   dependencies: {
+    pixelmatch: "^7.1.0",
     playwright: "^1.52.0",
     "playwright-core": "^1.52.0",
+    pngjs: "^7.0.0",
     "quickjs-emscripten": "^0.32.0",
   },
 });
@@ -136,6 +138,7 @@ async function handleExecute(socket: net.Socket, request: ExecuteRequest): Promi
       await manager.ensureBrowser(request.browser, {
         headless: request.headless,
         ignoreHTTPSErrors: request.ignoreHTTPSErrors,
+        proxy: request.proxy,
       });
     }
 

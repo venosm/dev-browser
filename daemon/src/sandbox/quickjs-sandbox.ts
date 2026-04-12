@@ -5,9 +5,13 @@ import type { Page } from "playwright";
 
 import type { BrowserManager } from "../browser-manager.js";
 import * as AuditManager from "../audit-manager.js";
+import * as CookieManager from "../cookie-manager.js";
 import * as ErrorCollector from "../error-collector.js";
+import * as FormManager from "../form-manager.js";
+import * as FuzzingManager from "../fuzzing-manager.js";
 import { NetworkManager } from "../network-manager.js";
 import { generateTest } from "../recording-manager.js";
+import * as SecurityManager from "../security-manager.js";
 import * as SessionManager from "../session-manager.js";
 import {
   ensureDevBrowserTempDir,
@@ -224,6 +228,28 @@ export class QuickJSSandbox {
           networkClearMocks: (pattern) => this.#networkManager!.clearMocks(pattern),
           networkGetLog: (options) => this.#networkManager!.getLog(options) as unknown,
           networkClearLog: () => this.#networkManager!.clearLog(),
+          networkIntercept: (pattern, mods) => this.#networkManager!.intercept(pattern, mods),
+          networkClearIntercepts: (pattern) => this.#networkManager!.clearIntercepts(pattern),
+          networkExportHar: () => this.#networkManager!.exportHar(),
+          networkImportHar: (har) => { this.#networkManager!.importHar(har); },
+          cookiesGet: (urls) => this.#cookiesGet(urls),
+          cookiesSet: (cookies) => this.#cookiesSet(cookies),
+          cookiesDelete: (filter) => this.#cookiesDelete(filter),
+          auditSecurityHeaders: (pageName, options) =>
+            this.#auditSecurityHeaders(pageName, options),
+          securityReplay: (index, mods) => this.#securityReplay(index, mods),
+          securityInspectCertificate: (pageName) => this.#securityInspectCertificate(pageName),
+          securityDetectXSS: (pageName, options) => this.#securityDetectXSS(pageName, options),
+          securityExtractCSRF: (pageName) => this.#securityExtractCSRF(pageName),
+          securityReplayWithCSRF: (index, token, options) =>
+            this.#securityReplayWithCSRF(index, token, options),
+          securityDetectForms: (pageName) => this.#securityDetectForms(pageName),
+          securityAutoFill: (pageName, credentials) =>
+            this.#securityAutoFill(pageName, credentials),
+          securitySubmitForm: (pageName, selector, data) =>
+            this.#securitySubmitForm(pageName, selector, data),
+          securityFuzz: (index, config) => this.#securityFuzz(index, config),
+          securityPayloads: (setName) => FuzzingManager.getPayloads(setName),
           screenshotSaveBaseline: (name, data) => VisualDiffManager.saveBaseline(name, data),
           screenshotCompare: (name, data, options) =>
             VisualDiffManager.compareWithBaseline(name, data, options) as unknown,
@@ -578,6 +604,30 @@ export class QuickJSSandbox {
                   },
                   enumerable: true,
                 },
+                intercept: {
+                  value: async (pattern, modifications) => {
+                    await hostCall("networkIntercept", JSON.stringify([pattern, modifications ?? {}]));
+                  },
+                  enumerable: true,
+                },
+                clearIntercepts: {
+                  value: async (pattern) => {
+                    await hostCall("networkClearIntercepts", JSON.stringify([pattern ?? null]));
+                  },
+                  enumerable: true,
+                },
+                exportHar: {
+                  value: async () => {
+                    return await hostCall("networkExportHar", JSON.stringify([]));
+                  },
+                  enumerable: true,
+                },
+                importHar: {
+                  value: async (har) => {
+                    await hostCall("networkImportHar", JSON.stringify([har]));
+                  },
+                  enumerable: true,
+                },
               });
               Object.freeze(networkApi);
               Object.defineProperty(globalThis, "network", {
@@ -913,9 +963,128 @@ export class QuickJSSandbox {
                   },
                   enumerable: true,
                 },
+                securityHeaders: {
+                  value: async (pageName, options) => {
+                    return await hostCall("auditSecurityHeaders", JSON.stringify([pageName, options ?? {}]));
+                  },
+                  enumerable: true,
+                },
               }));
               Object.defineProperty(globalThis, "audit", {
                 value: auditApi,
+                configurable: false,
+                enumerable: true,
+                writable: false,
+              });
+
+              // --- cookies API ---
+              const cookiesApi = Object.freeze(Object.create(null, {
+                get: {
+                  value: async (urls) => {
+                    return await hostCall("cookiesGet", JSON.stringify([urls ?? null]));
+                  },
+                  enumerable: true,
+                },
+                set: {
+                  value: async (cookies) => {
+                    await hostCall("cookiesSet", JSON.stringify([cookies]));
+                  },
+                  enumerable: true,
+                },
+                delete: {
+                  value: async (filter) => {
+                    await hostCall("cookiesDelete", JSON.stringify([filter ?? null]));
+                  },
+                  enumerable: true,
+                },
+              }));
+              Object.defineProperty(globalThis, "cookies", {
+                value: cookiesApi,
+                configurable: false,
+                enumerable: true,
+                writable: false,
+              });
+
+              // --- security API (pentesting primitives) ---
+              const securityApi = Object.freeze(Object.create(null, {
+                replay: {
+                  value: async (logIndex, modifications) => {
+                    return await hostCall(
+                      "securityReplay",
+                      JSON.stringify([logIndex, modifications ?? {}]),
+                    );
+                  },
+                  enumerable: true,
+                },
+                inspectCertificate: {
+                  value: async (pageName) => {
+                    return await hostCall("securityInspectCertificate", JSON.stringify([pageName]));
+                  },
+                  enumerable: true,
+                },
+                detectXSS: {
+                  value: async (pageName, options) => {
+                    return await hostCall(
+                      "securityDetectXSS",
+                      JSON.stringify([pageName, options ?? {}]),
+                    );
+                  },
+                  enumerable: true,
+                },
+                extractCSRFTokens: {
+                  value: async (pageName) => {
+                    return await hostCall("securityExtractCSRF", JSON.stringify([pageName]));
+                  },
+                  enumerable: true,
+                },
+                replayWithCSRF: {
+                  value: async (logIndex, token, options) => {
+                    return await hostCall(
+                      "securityReplayWithCSRF",
+                      JSON.stringify([logIndex, token, options ?? {}]),
+                    );
+                  },
+                  enumerable: true,
+                },
+                detectForms: {
+                  value: async (pageName) => {
+                    return await hostCall("securityDetectForms", JSON.stringify([pageName]));
+                  },
+                  enumerable: true,
+                },
+                autoFill: {
+                  value: async (pageName, credentials) => {
+                    await hostCall("securityAutoFill", JSON.stringify([pageName, credentials]));
+                  },
+                  enumerable: true,
+                },
+                submitForm: {
+                  value: async (pageName, selector, data) => {
+                    await hostCall(
+                      "securitySubmitForm",
+                      JSON.stringify([pageName, selector, data]),
+                    );
+                  },
+                  enumerable: true,
+                },
+                fuzz: {
+                  value: async (logIndex, config) => {
+                    return await hostCall(
+                      "securityFuzz",
+                      JSON.stringify([logIndex, config ?? {}]),
+                    );
+                  },
+                  enumerable: true,
+                },
+                payloads: {
+                  value: async (setName) => {
+                    return await hostCall("securityPayloads", JSON.stringify([setName]));
+                  },
+                  enumerable: true,
+                },
+              }));
+              Object.defineProperty(globalThis, "security", {
+                value: securityApi,
                 configurable: false,
                 enumerable: true,
                 writable: false,
@@ -1230,6 +1399,123 @@ export class QuickJSSandbox {
     if (kind === "accessibility") return await AuditManager.auditAccessibility(page, opts);
     if (kind === "performance") return await AuditManager.auditPerformance(page, opts);
     return await AuditManager.auditFull(page, opts);
+  }
+
+  #requireContext() {
+    const entry = this.#options.manager.getBrowser(this.#options.browserName);
+    if (!entry) throw new Error(`Browser "${this.#options.browserName}" not found`);
+    return entry;
+  }
+
+  #requireNamedPage(pageName: unknown) {
+    const name = requireString(pageName, "Page name");
+    const entry = this.#requireContext();
+    const page = entry.pages.get(name);
+    if (!page) {
+      throw new Error(`No named page "${name}" — call browser.getPage("${name}") first`);
+    }
+    return { entry, page };
+  }
+
+  async #cookiesGet(urls: unknown): Promise<unknown> {
+    const { entry } = { entry: this.#requireContext() };
+    return CookieManager.getCookies(entry.context, urls);
+  }
+
+  async #cookiesSet(cookies: unknown): Promise<void> {
+    const entry = this.#requireContext();
+    await CookieManager.setCookies(entry.context, cookies);
+  }
+
+  async #cookiesDelete(filter: unknown): Promise<void> {
+    const entry = this.#requireContext();
+    await CookieManager.deleteCookies(entry.context, filter);
+  }
+
+  async #auditSecurityHeaders(pageName: unknown, options: unknown): Promise<unknown> {
+    const { page } = this.#requireNamedPage(pageName);
+    const opts = (options && typeof options === "object" ? options : {}) as AuditManager.SecurityHeadersOptions;
+    return AuditManager.auditSecurityHeaders(page, opts);
+  }
+
+  #requireLogEntry(index: unknown) {
+    if (!this.#networkManager) {
+      throw new Error("Network manager is not available");
+    }
+    return this.#networkManager.getLogEntry(index);
+  }
+
+  async #securityReplay(index: unknown, modifications: unknown): Promise<unknown> {
+    const entry = this.#requireContext();
+    const logEntry = this.#requireLogEntry(index);
+    const mods = (modifications && typeof modifications === "object"
+      ? modifications
+      : {}) as SecurityManager.ReplayModifications;
+    return SecurityManager.replayRequest(entry.context, logEntry, mods);
+  }
+
+  async #securityInspectCertificate(pageName: unknown): Promise<unknown> {
+    const { entry, page } = this.#requireNamedPage(pageName);
+    return SecurityManager.inspectCertificate(entry.context, page);
+  }
+
+  async #securityDetectXSS(pageName: unknown, options: unknown): Promise<unknown> {
+    const { page } = this.#requireNamedPage(pageName);
+    const opts = (options && typeof options === "object" ? options : {}) as SecurityManager.XSSOptions;
+    return SecurityManager.detectXSS(page, opts);
+  }
+
+  async #securityExtractCSRF(pageName: unknown): Promise<unknown> {
+    const { page } = this.#requireNamedPage(pageName);
+    return SecurityManager.extractCSRFTokens(page);
+  }
+
+  async #securityReplayWithCSRF(
+    index: unknown,
+    token: unknown,
+    options: unknown
+  ): Promise<unknown> {
+    const entry = this.#requireContext();
+    const logEntry = this.#requireLogEntry(index);
+    const tokenStr = requireString(token, "CSRF token");
+    const opts = (options && typeof options === "object" ? options : {}) as {
+      headerName?: string;
+      paramName?: string;
+    };
+    return SecurityManager.replayWithCSRF(entry.context, logEntry, tokenStr, opts);
+  }
+
+  async #securityDetectForms(pageName: unknown): Promise<unknown> {
+    const { page } = this.#requireNamedPage(pageName);
+    return FormManager.detectForms(page);
+  }
+
+  async #securityAutoFill(pageName: unknown, credentials: unknown): Promise<void> {
+    const { page } = this.#requireNamedPage(pageName);
+    if (!credentials || typeof credentials !== "object") {
+      throw new TypeError("security.autoFill: credentials must be an object");
+    }
+    await FormManager.autoFillForm(page, credentials as FormManager.LoginCredentials);
+  }
+
+  async #securitySubmitForm(
+    pageName: unknown,
+    selector: unknown,
+    data: unknown
+  ): Promise<void> {
+    const { page } = this.#requireNamedPage(pageName);
+    const sel = requireString(selector, "Form selector");
+    if (!data || typeof data !== "object") {
+      throw new TypeError("security.submitForm: data must be an object");
+    }
+    await FormManager.submitForm(page, sel, data as Record<string, string>);
+  }
+
+  async #securityFuzz(index: unknown, config: unknown): Promise<unknown> {
+    const entry = this.#requireContext();
+    const logEntry = this.#requireLogEntry(index);
+    const cfg = (config && typeof config === "object" ? config : {}) as FuzzingManager.FuzzConfig;
+    return FuzzingManager.fuzzRequest(entry.context, logEntry, cfg);
   }
 
   async #cleanupAnonymousPages(options: { suppressErrors?: boolean } = {}): Promise<void> {

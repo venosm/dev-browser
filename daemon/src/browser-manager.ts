@@ -13,6 +13,7 @@ export interface BrowserEntry {
   endpoint?: string;
   headless: boolean;
   ignoreHTTPSErrors: boolean;
+  proxy?: string;
 }
 
 interface BrowserSummary {
@@ -92,6 +93,7 @@ export class BrowserManager {
     options: {
       headless?: boolean;
       ignoreHTTPSErrors?: boolean;
+      proxy?: string;
     } = {}
   ): Promise<BrowserEntry> {
     await this.ensureBaseDir();
@@ -99,6 +101,7 @@ export class BrowserManager {
     const requestedHeadless = options.headless ?? existing?.headless ?? false;
     const requestedIgnoreHTTPSErrors =
       options.ignoreHTTPSErrors ?? existing?.ignoreHTTPSErrors ?? false;
+    const requestedProxy = options.proxy ?? existing?.proxy;
 
     if (existing) {
       const needsRelaunch =
@@ -106,7 +109,8 @@ export class BrowserManager {
         !existing.browser.isConnected() ||
         (options.headless !== undefined && existing.headless !== requestedHeadless) ||
         (options.ignoreHTTPSErrors !== undefined &&
-          existing.ignoreHTTPSErrors !== requestedIgnoreHTTPSErrors);
+          existing.ignoreHTTPSErrors !== requestedIgnoreHTTPSErrors) ||
+        (options.proxy !== undefined && existing.proxy !== requestedProxy);
 
       if (!needsRelaunch) {
         return existing;
@@ -115,7 +119,7 @@ export class BrowserManager {
       await this.stopBrowser(name);
     }
 
-    return this.launchBrowser(name, requestedHeadless, requestedIgnoreHTTPSErrors);
+    return this.launchBrowser(name, requestedHeadless, requestedIgnoreHTTPSErrors, requestedProxy);
   }
 
   async autoConnect(name: string): Promise<BrowserEntry> {
@@ -349,18 +353,24 @@ export class BrowserManager {
   private async launchBrowser(
     name: string,
     headless: boolean,
-    ignoreHTTPSErrors: boolean
+    ignoreHTTPSErrors: boolean,
+    proxy?: string
   ): Promise<BrowserEntry> {
     const profileDir = path.join(this.baseDir, name, "chromium-profile");
     await this.dependencies.mkdir(profileDir, { recursive: true });
 
-    const context = await this.dependencies.launchPersistentContext(profileDir, {
+    const launchOptions: Parameters<typeof chromium.launchPersistentContext>[1] = {
       headless,
       ignoreHTTPSErrors,
       handleSIGINT: false,
       handleSIGTERM: false,
       handleSIGHUP: false,
-    });
+    };
+    if (proxy) {
+      launchOptions.proxy = { server: proxy };
+    }
+
+    const context = await this.dependencies.launchPersistentContext(profileDir, launchOptions);
     const browser = context.browser();
 
     if (!browser) {
@@ -377,6 +387,7 @@ export class BrowserManager {
       profileDir,
       headless,
       ignoreHTTPSErrors,
+      proxy,
     };
 
     this.attachBrowserLifecycle(entry);

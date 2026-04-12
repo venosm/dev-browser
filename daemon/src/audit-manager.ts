@@ -272,6 +272,274 @@ export async function auditPerformance(
   };
 }
 
+// ── Security Headers ──────────────────────────────────────────────────────────
+
+export interface SecurityHeadersOptions {
+  /** Provide deeper parsing of CSP directives, HSTS max-age, etc. */
+  detailed?: boolean;
+  /** Optional URL to probe directly; defaults to page.url() */
+  url?: string;
+}
+
+export interface SecurityHeaderFinding {
+  present: boolean;
+  value?: string;
+  rating: "good" | "weak" | "missing" | "bad";
+  notes?: string[];
+  remediation?: string;
+}
+
+export interface SecurityHeadersReport {
+  url: string;
+  headers: Record<string, SecurityHeaderFinding>;
+  score: number;
+  recommendations: string[];
+  summary: string;
+}
+
+const SECURITY_HEADERS: Array<{
+  name: string;
+  canonical: string;
+  required: boolean;
+  remediation: string;
+}> = [
+  {
+    name: "strict-transport-security",
+    canonical: "Strict-Transport-Security",
+    required: true,
+    remediation: "Strict-Transport-Security: max-age=31536000; includeSubDomains; preload",
+  },
+  {
+    name: "content-security-policy",
+    canonical: "Content-Security-Policy",
+    required: true,
+    remediation:
+      "Content-Security-Policy: default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+  },
+  {
+    name: "x-content-type-options",
+    canonical: "X-Content-Type-Options",
+    required: true,
+    remediation: "X-Content-Type-Options: nosniff",
+  },
+  {
+    name: "x-frame-options",
+    canonical: "X-Frame-Options",
+    required: true,
+    remediation: "X-Frame-Options: DENY",
+  },
+  {
+    name: "referrer-policy",
+    canonical: "Referrer-Policy",
+    required: true,
+    remediation: "Referrer-Policy: strict-origin-when-cross-origin",
+  },
+  {
+    name: "permissions-policy",
+    canonical: "Permissions-Policy",
+    required: false,
+    remediation: "Permissions-Policy: geolocation=(), microphone=(), camera=()",
+  },
+  {
+    name: "cross-origin-opener-policy",
+    canonical: "Cross-Origin-Opener-Policy",
+    required: false,
+    remediation: "Cross-Origin-Opener-Policy: same-origin",
+  },
+  {
+    name: "cross-origin-embedder-policy",
+    canonical: "Cross-Origin-Embedder-Policy",
+    required: false,
+    remediation: "Cross-Origin-Embedder-Policy: require-corp",
+  },
+  {
+    name: "cross-origin-resource-policy",
+    canonical: "Cross-Origin-Resource-Policy",
+    required: false,
+    remediation: "Cross-Origin-Resource-Policy: same-origin",
+  },
+];
+
+function analyzeHsts(value: string): { rating: "good" | "weak" | "bad"; notes: string[] } {
+  const notes: string[] = [];
+  const maxAgeMatch = /max-age\s*=\s*(\d+)/i.exec(value);
+  const maxAge = maxAgeMatch ? Number.parseInt(maxAgeMatch[1]!, 10) : 0;
+
+  if (maxAge === 0) {
+    notes.push("max-age is 0 or missing");
+    return { rating: "bad", notes };
+  }
+  if (maxAge < 31_536_000) {
+    notes.push(`max-age=${maxAge} (< 1 year; recommend >= 31536000)`);
+  }
+  if (!/includeSubDomains/i.test(value)) {
+    notes.push("missing includeSubDomains");
+  }
+  if (!/preload/i.test(value)) {
+    notes.push("missing preload directive");
+  }
+
+  return {
+    rating: maxAge >= 31_536_000 && /includeSubDomains/i.test(value) ? "good" : "weak",
+    notes,
+  };
+}
+
+function analyzeCsp(value: string): { rating: "good" | "weak" | "bad"; notes: string[] } {
+  const notes: string[] = [];
+  const lower = value.toLowerCase();
+
+  if (lower.includes("'unsafe-inline'")) {
+    notes.push("contains 'unsafe-inline' — allows inline scripts/styles");
+  }
+  if (lower.includes("'unsafe-eval'")) {
+    notes.push("contains 'unsafe-eval' — allows eval() execution");
+  }
+  if (/default-src\s+\*/i.test(value) || /script-src\s+\*/i.test(value)) {
+    notes.push("wildcard source (*) weakens policy");
+  }
+  if (!/default-src/i.test(value) && !/script-src/i.test(value)) {
+    notes.push("no default-src or script-src directive");
+  }
+  if (!/object-src\s+'none'/i.test(value)) {
+    notes.push("object-src should be 'none'");
+  }
+  if (!/frame-ancestors/i.test(value)) {
+    notes.push("missing frame-ancestors directive");
+  }
+
+  if (notes.some((n) => n.includes("unsafe-") || n.includes("wildcard"))) {
+    return { rating: "bad", notes };
+  }
+  if (notes.length > 0) {
+    return { rating: "weak", notes };
+  }
+  return { rating: "good", notes };
+}
+
+function analyzeXcto(value: string): { rating: "good" | "bad"; notes: string[] } {
+  if (value.trim().toLowerCase() === "nosniff") {
+    return { rating: "good", notes: [] };
+  }
+  return { rating: "bad", notes: [`expected "nosniff", got "${value}"`] };
+}
+
+function analyzeXfo(value: string): { rating: "good" | "weak" | "bad"; notes: string[] } {
+  const v = value.trim().toUpperCase();
+  if (v === "DENY") return { rating: "good", notes: [] };
+  if (v === "SAMEORIGIN") return { rating: "weak", notes: ["SAMEORIGIN allows same-origin framing; prefer DENY"] };
+  return { rating: "bad", notes: [`unrecognized value "${value}"`] };
+}
+
+export async function auditSecurityHeaders(
+  page: Page,
+  options: SecurityHeadersOptions = {}
+): Promise<SecurityHeadersReport> {
+  const targetUrl = options.url ?? page.url();
+  if (!/^https?:\/\//.test(targetUrl)) {
+    throw new Error(`auditSecurityHeaders: invalid URL "${targetUrl}"`);
+  }
+
+  const response = await page.request.get(targetUrl, {
+    maxRedirects: 0,
+    failOnStatusCode: false,
+  });
+
+  const rawHeaders = response.headers();
+  const headerMap = new Map<string, string>();
+  for (const [name, value] of Object.entries(rawHeaders)) {
+    headerMap.set(name.toLowerCase(), value);
+  }
+
+  const findings: Record<string, SecurityHeaderFinding> = {};
+  const recommendations: string[] = [];
+  let score = 100;
+
+  for (const spec of SECURITY_HEADERS) {
+    const value = headerMap.get(spec.name);
+
+    if (value === undefined) {
+      findings[spec.canonical] = {
+        present: false,
+        rating: spec.required ? "missing" : "weak",
+        remediation: spec.remediation,
+      };
+      if (spec.required) {
+        score -= 12;
+        recommendations.push(`Add ${spec.canonical}: ${spec.remediation}`);
+      } else {
+        score -= 4;
+      }
+      continue;
+    }
+
+    let rating: SecurityHeaderFinding["rating"] = "good";
+    const notes: string[] = [];
+
+    if (options.detailed) {
+      switch (spec.name) {
+        case "strict-transport-security": {
+          const r = analyzeHsts(value);
+          rating = r.rating;
+          notes.push(...r.notes);
+          break;
+        }
+        case "content-security-policy": {
+          const r = analyzeCsp(value);
+          rating = r.rating;
+          notes.push(...r.notes);
+          break;
+        }
+        case "x-content-type-options": {
+          const r = analyzeXcto(value);
+          rating = r.rating;
+          notes.push(...r.notes);
+          break;
+        }
+        case "x-frame-options": {
+          const r = analyzeXfo(value);
+          rating = r.rating;
+          notes.push(...r.notes);
+          break;
+        }
+      }
+    }
+
+    if (rating === "bad") {
+      score -= 10;
+      recommendations.push(`Fix ${spec.canonical}: ${notes.join("; ")} → ${spec.remediation}`);
+    } else if (rating === "weak") {
+      score -= 5;
+      recommendations.push(`Strengthen ${spec.canonical}: ${notes.join("; ")}`);
+    }
+
+    findings[spec.canonical] = {
+      present: true,
+      value,
+      rating,
+      notes: notes.length > 0 ? notes : undefined,
+      remediation: rating !== "good" ? spec.remediation : undefined,
+    };
+  }
+
+  score = Math.max(0, score);
+
+  const missing = Object.values(findings).filter((f) => !f.present).length;
+  const weak = Object.values(findings).filter((f) => f.present && (f.rating === "weak" || f.rating === "bad")).length;
+  const summary =
+    missing === 0 && weak === 0
+      ? `All recommended security headers present and well-configured (score ${score}/100)`
+      : `${missing} missing, ${weak} weak/bad (score ${score}/100)`;
+
+  return {
+    url: targetUrl,
+    headers: findings,
+    score,
+    recommendations,
+    summary,
+  };
+}
+
 // ── Full audit ────────────────────────────────────────────────────────────────
 
 export async function auditFull(

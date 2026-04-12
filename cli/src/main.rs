@@ -144,6 +144,14 @@ struct Cli {
 
     #[arg(
         long,
+        value_name = "URL",
+        help = "Route browser traffic through an HTTP or SOCKS proxy",
+        long_help = "Route all browser traffic through the specified proxy server.\n\nSupports HTTP and SOCKS5 proxies, e.g. http://127.0.0.1:8080 or socks5://127.0.0.1:1080.\nUseful for routing through Burp Suite, ZAP, mitmproxy, or other intercepting proxies.\n\nThis only affects daemon-launched browsers. It has no effect when `--connect` attaches to an already-running external browser."
+    )]
+    proxy: Option<String>,
+
+    #[arg(
+        long,
         default_value_t = DEFAULT_SCRIPT_TIMEOUT_SECS,
         value_name = "SECONDS",
         value_parser = clap::value_parser!(u32).range(1..),
@@ -344,6 +352,10 @@ fn run_script(cli: &Cli, script: String) -> Result<i32, Box<dyn Error>> {
 
     if cli.ignore_https_errors {
         request["ignoreHTTPSErrors"] = Value::Bool(true);
+    }
+
+    if let Some(proxy_url) = &cli.proxy {
+        request["proxy"] = Value::String(proxy_url.clone());
     }
 
     if let Some(endpoint) = &cli.connect {
