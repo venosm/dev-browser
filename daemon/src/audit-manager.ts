@@ -1,6 +1,8 @@
 import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
-import type { Page } from "playwright";
+import type { BrowserContext, Page } from "playwright";
+
+import type { NetworkLogEntry } from "./network-manager.js";
 
 const _require = createRequire(import.meta.url);
 
@@ -557,4 +559,419 @@ export async function auditFull(
   ].join("\n");
 
   return { url: page.url(), accessibility, performance, summary };
+}
+
+// ── Mixed content & CSP report ───────────────────────────────────────────────
+
+export interface MixedContentOptions {
+  /** Restrict analysis to entries matching this URL substring. */
+  urlFilter?: string;
+}
+
+export interface MixedContentViolation {
+  url: string;
+  initiatorUrl: string;
+  resourceType: string;
+  reason: "http-on-https" | "blocked-by-csp" | "missing-sri" | "wildcard-csp-source";
+  severity: "high" | "medium" | "low";
+  detail: string;
+}
+
+export interface CspDirective {
+  name: string;
+  sources: string[];
+  issues: string[];
+}
+
+export interface MixedContentReport {
+  url: string;
+  pageIsHttps: boolean;
+  csp: {
+    present: boolean;
+    reportOnly: boolean;
+    raw?: string;
+    directives: CspDirective[];
+  };
+  violations: MixedContentViolation[];
+  inspectedResources: number;
+  summary: string;
+}
+
+function parseCspDirectives(raw: string): CspDirective[] {
+  const directives: CspDirective[] = [];
+  for (const part of raw.split(";")) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    const [name, ...sources] = trimmed.split(/\s+/);
+    if (!name) continue;
+    const issues: string[] = [];
+    if (sources.includes("*")) issues.push("wildcard source '*'");
+    if (sources.includes("'unsafe-inline'")) issues.push("'unsafe-inline' allowed");
+    if (sources.includes("'unsafe-eval'")) issues.push("'unsafe-eval' allowed");
+    if (sources.some((s) => s.startsWith("data:"))) issues.push("data: scheme allowed");
+    directives.push({ name: name.toLowerCase(), sources, issues });
+  }
+  return directives;
+}
+
+export async function auditMixedContent(
+  page: Page,
+  log: NetworkLogEntry[],
+  options: MixedContentOptions = {}
+): Promise<MixedContentReport> {
+  const url = page.url();
+  const pageIsHttps = url.startsWith("https://");
+
+  const pageDoc = [...log].reverse().find((e) => e.url === url) ?? log[log.length - 1];
+  const rawCspHeader = pageDoc?.responseHeaders["content-security-policy"];
+  const rawCspReportOnly = pageDoc?.responseHeaders["content-security-policy-report-only"];
+  const rawCsp = rawCspHeader ?? rawCspReportOnly;
+  const directives = rawCsp ? parseCspDirectives(rawCsp) : [];
+
+  const entries = options.urlFilter
+    ? log.filter((e) => e.url.includes(options.urlFilter!))
+    : log;
+
+  const violations: MixedContentViolation[] = [];
+
+  for (const entry of entries) {
+    if (pageIsHttps && entry.url.startsWith("http://")) {
+      violations.push({
+        url: entry.url,
+        initiatorUrl: url,
+        resourceType: entry.resourceType,
+        reason: "http-on-https",
+        severity: entry.resourceType === "script" || entry.resourceType === "stylesheet"
+          ? "high"
+          : "medium",
+        detail: `${entry.resourceType} loaded over insecure http:// on an https:// page`,
+      });
+    }
+    if (entry.status === 0 && entry.url !== url) {
+      const cspBlocked = Object.keys(entry.responseHeaders).length === 0;
+      if (cspBlocked && rawCsp) {
+        violations.push({
+          url: entry.url,
+          initiatorUrl: url,
+          resourceType: entry.resourceType,
+          reason: "blocked-by-csp",
+          severity: "medium",
+          detail: "resource request failed — likely blocked by CSP",
+        });
+      }
+    }
+  }
+
+  // Flag external scripts without SRI (heuristic: script requests where response was served,
+  // request to a different origin, and no integrity hash in our log — we only have headers so
+  // we surface this as a hint).
+  const pageOrigin = (() => {
+    try {
+      return new URL(url).origin;
+    } catch {
+      return "";
+    }
+  })();
+  for (const entry of entries) {
+    if (entry.resourceType !== "script") continue;
+    try {
+      const origin = new URL(entry.url).origin;
+      if (origin && origin !== pageOrigin && !entry.requestHeaders["integrity"]) {
+        // Playwright doesn't expose the `<script integrity>` attribute via the network log;
+        // we treat cross-origin scripts as "consider SRI" hints only.
+        violations.push({
+          url: entry.url,
+          initiatorUrl: url,
+          resourceType: entry.resourceType,
+          reason: "missing-sri",
+          severity: "low",
+          detail: "cross-origin script — consider adding a Subresource Integrity (SRI) hash",
+        });
+      }
+    } catch {
+      // malformed URL
+    }
+  }
+
+  for (const dir of directives) {
+    if (dir.issues.includes("wildcard source '*'")) {
+      violations.push({
+        url,
+        initiatorUrl: url,
+        resourceType: "document",
+        reason: "wildcard-csp-source",
+        severity: "medium",
+        detail: `CSP ${dir.name} allows wildcard source`,
+      });
+    }
+  }
+
+  const summaryParts: string[] = [];
+  if (!rawCsp) summaryParts.push("no CSP present");
+  else if (rawCspReportOnly && !rawCspHeader) summaryParts.push("CSP is report-only");
+  const highCount = violations.filter((v) => v.severity === "high").length;
+  if (highCount > 0) summaryParts.push(`${highCount} high-severity`);
+  summaryParts.push(`${violations.length} total issue(s)`);
+
+  return {
+    url,
+    pageIsHttps,
+    csp: {
+      present: !!rawCsp,
+      reportOnly: !!rawCspReportOnly && !rawCspHeader,
+      raw: rawCsp,
+      directives,
+    },
+    violations,
+    inspectedResources: entries.length,
+    summary: summaryParts.join(", "),
+  };
+}
+
+// ── Auth audit (cookies + tokens) ────────────────────────────────────────────
+
+export interface AuthAuditOptions {
+  /** Include non-auth-looking cookies in the report (default false). */
+  includeAllCookies?: boolean;
+}
+
+export interface CookieFlagFinding {
+  name: string;
+  domain: string;
+  path: string;
+  secure: boolean;
+  httpOnly: boolean;
+  sameSite: string;
+  expires: number;
+  likelyAuth: boolean;
+  issues: string[];
+}
+
+export interface JwtFinding {
+  location: "cookie" | "localStorage" | "sessionStorage";
+  key: string;
+  algorithm: string | null;
+  issuer: string | null;
+  subject: string | null;
+  audience: string | null;
+  expiresAt: string | null;
+  expired: boolean;
+  issues: string[];
+}
+
+export interface AuthAuditReport {
+  url: string;
+  score: number;
+  cookies: CookieFlagFinding[];
+  jwts: JwtFinding[];
+  issues: string[];
+  summary: string;
+}
+
+const AUTH_KEYWORDS_AUDIT = [
+  "token",
+  "auth",
+  "session",
+  "jwt",
+  "access",
+  "sid",
+  "csrf",
+  "login",
+  "xsrf",
+];
+const JWT_RE = /^eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+
+function isAuthCookie(name: string): boolean {
+  const lower = name.toLowerCase();
+  return AUTH_KEYWORDS_AUDIT.some((kw) => lower.includes(kw));
+}
+
+function looksLikeJwt(value: string): boolean {
+  return JWT_RE.test(value.trim());
+}
+
+function decodeJwtParts(token: string): { header: Record<string, unknown>; payload: Record<string, unknown> } | null {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) return null;
+    const decode = (segment: string): Record<string, unknown> => {
+      const b64 = segment.replace(/-/g, "+").replace(/_/g, "/");
+      const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+      return JSON.parse(Buffer.from(padded, "base64").toString("utf-8")) as Record<string, unknown>;
+    };
+    return { header: decode(parts[0]!), payload: decode(parts[1]!) };
+  } catch {
+    return null;
+  }
+}
+
+export async function auditAuth(
+  context: BrowserContext,
+  page: Page,
+  options: AuthAuditOptions = {}
+): Promise<AuthAuditReport> {
+  const url = page.url();
+  const allCookies = await context.cookies();
+  const topLevelIssues: string[] = [];
+
+  const cookieFindings: CookieFlagFinding[] = [];
+  for (const c of allCookies) {
+    const likelyAuth = isAuthCookie(c.name);
+    if (!options.includeAllCookies && !likelyAuth) continue;
+
+    const issues: string[] = [];
+    if (likelyAuth) {
+      if (!c.secure) issues.push("missing Secure flag");
+      if (!c.httpOnly) issues.push("missing HttpOnly flag");
+      if (c.sameSite === "None" && !c.secure) {
+        issues.push("SameSite=None requires Secure");
+      }
+      if (c.sameSite !== "Strict" && c.sameSite !== "Lax") {
+        issues.push(`weak SameSite=${c.sameSite}`);
+      }
+      if (c.expires > 0) {
+        const ageDays = (c.expires * 1000 - Date.now()) / 86_400_000;
+        if (ageDays > 365) issues.push(`very long-lived (${Math.round(ageDays)} days)`);
+      }
+    }
+
+    cookieFindings.push({
+      name: c.name,
+      domain: c.domain,
+      path: c.path,
+      secure: c.secure,
+      httpOnly: c.httpOnly,
+      sameSite: c.sameSite,
+      expires: c.expires,
+      likelyAuth,
+      issues,
+    });
+  }
+
+  const jwtFindings: JwtFinding[] = [];
+
+  // JWTs in cookies
+  for (const c of allCookies) {
+    if (!looksLikeJwt(c.value)) continue;
+    const decoded = decodeJwtParts(c.value);
+    if (!decoded) continue;
+    const issues: string[] = [];
+    const alg = typeof decoded.header.alg === "string" ? decoded.header.alg : null;
+    if (alg === "none") issues.push("JWT alg=none (accepts any token)");
+    if (alg === "HS256" && typeof decoded.payload.iss !== "string") {
+      issues.push("HS256 without issuer (unvalidatable)");
+    }
+    const exp = typeof decoded.payload.exp === "number" ? decoded.payload.exp : null;
+    const expired = exp !== null && exp * 1000 < Date.now();
+    if (expired) issues.push("token expired");
+    if (exp === null) issues.push("no `exp` claim");
+    jwtFindings.push({
+      location: "cookie",
+      key: c.name,
+      algorithm: alg,
+      issuer: typeof decoded.payload.iss === "string" ? decoded.payload.iss : null,
+      subject: typeof decoded.payload.sub === "string" ? decoded.payload.sub : null,
+      audience:
+        typeof decoded.payload.aud === "string"
+          ? decoded.payload.aud
+          : Array.isArray(decoded.payload.aud)
+            ? decoded.payload.aud.join(",")
+            : null,
+      expiresAt: exp ? new Date(exp * 1000).toISOString() : null,
+      expired,
+      issues,
+    });
+  }
+
+  // JWTs in web storage (current page only)
+  try {
+    const storageTokens = (await page.evaluate(() => {
+      const re = /^eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+      const out: Array<{ location: "localStorage" | "sessionStorage"; key: string; value: string }> = [];
+      try {
+        for (let i = 0; i < localStorage.length; i++) {
+          const key = localStorage.key(i);
+          if (!key) continue;
+          const value = localStorage.getItem(key) ?? "";
+          if (re.test(value.trim())) out.push({ location: "localStorage", key, value });
+        }
+      } catch {
+        // restricted origin
+      }
+      try {
+        for (let i = 0; i < sessionStorage.length; i++) {
+          const key = sessionStorage.key(i);
+          if (!key) continue;
+          const value = sessionStorage.getItem(key) ?? "";
+          if (re.test(value.trim())) out.push({ location: "sessionStorage", key, value });
+        }
+      } catch {
+        // restricted origin
+      }
+      return out;
+    })) as Array<{ location: "localStorage" | "sessionStorage"; key: string; value: string }>;
+
+    for (const entry of storageTokens) {
+      const decoded = decodeJwtParts(entry.value);
+      if (!decoded) continue;
+      const issues: string[] = [];
+      const alg = typeof decoded.header.alg === "string" ? decoded.header.alg : null;
+      if (alg === "none") issues.push("JWT alg=none (accepts any token)");
+      if (entry.location === "localStorage") {
+        issues.push("token stored in localStorage — vulnerable to XSS");
+      }
+      const exp = typeof decoded.payload.exp === "number" ? decoded.payload.exp : null;
+      const expired = exp !== null && exp * 1000 < Date.now();
+      if (expired) issues.push("token expired");
+      if (exp === null) issues.push("no `exp` claim");
+      jwtFindings.push({
+        location: entry.location,
+        key: entry.key,
+        algorithm: alg,
+        issuer: typeof decoded.payload.iss === "string" ? decoded.payload.iss : null,
+        subject: typeof decoded.payload.sub === "string" ? decoded.payload.sub : null,
+        audience:
+          typeof decoded.payload.aud === "string"
+            ? decoded.payload.aud
+            : Array.isArray(decoded.payload.aud)
+              ? decoded.payload.aud.join(",")
+              : null,
+        expiresAt: exp ? new Date(exp * 1000).toISOString() : null,
+        expired,
+        issues,
+      });
+    }
+  } catch {
+    // page may not allow evaluate (e.g. about:blank)
+  }
+
+  // Score: deduct per issue
+  let score = 100;
+  for (const c of cookieFindings) score -= c.issues.length * 8;
+  for (const j of jwtFindings) {
+    score -= j.issues.length * 8;
+    if (j.issues.some((i) => i.includes("alg=none"))) score -= 30;
+    if (j.issues.some((i) => i.includes("localStorage"))) score -= 15;
+  }
+  score = Math.max(0, score);
+
+  if (cookieFindings.filter((c) => c.likelyAuth).length === 0 && jwtFindings.length === 0) {
+    topLevelIssues.push("no auth cookies or tokens detected on this page");
+  }
+
+  const issueCount = cookieFindings.reduce((n, c) => n + c.issues.length, 0) +
+    jwtFindings.reduce((n, j) => n + j.issues.length, 0);
+  const summary =
+    issueCount === 0
+      ? `Auth configuration looks clean (score ${score}/100)`
+      : `${issueCount} issue(s) across ${cookieFindings.length} cookie(s) and ${jwtFindings.length} token(s) — score ${score}/100`;
+
+  return {
+    url,
+    score,
+    cookies: cookieFindings,
+    jwts: jwtFindings,
+    issues: topLevelIssues,
+    summary,
+  };
 }

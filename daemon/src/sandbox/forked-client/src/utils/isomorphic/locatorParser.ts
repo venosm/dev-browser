@@ -113,14 +113,26 @@ function shiftParams(template: string, sub: number) {
 }
 
 function transform(template: string, params: TemplateParams, testIdAttributeName: string): string {
-  // Recursively handle filter(has=, hasnot=, sethas(), sethasnot()).
-  // TODO: handle and(locator), or(locator), locator(locator), locator(has=, hasnot=, sethas(), sethasnot()).
+  // Recursively handle filter(has=, hasnot=, sethas(), sethasnot()), locator(..., has=, ...)
+  // and the composite forms and(locator), or(locator). Each form takes an inner locator that
+  // must be transformed recursively before it can be embedded in the outer selector.
   while (true) {
     const hasMatch = template.match(/filter\(,?(has=|hasnot=|sethas\(|sethasnot\()/);
-    if (!hasMatch) break;
+    const locatorHasMatch = template.match(/locator\([^()]*?,(has=|hasnot=|sethas\(|sethasnot\()/);
+    const andOrMatch = template.match(/\.(and|or)\(/);
 
-    // Extract inner locator based on balanced parens.
-    const start = hasMatch.index! + hasMatch[0].length;
+    type MatchKind = "filter-has" | "locator-has" | "and-or";
+    type Candidate = { match: RegExpMatchArray; kind: MatchKind };
+    const candidates: Candidate[] = [];
+    if (hasMatch) candidates.push({ match: hasMatch, kind: "filter-has" });
+    if (locatorHasMatch) candidates.push({ match: locatorHasMatch, kind: "locator-has" });
+    if (andOrMatch) candidates.push({ match: andOrMatch, kind: "and-or" });
+    if (candidates.length === 0) break;
+    candidates.sort((a, b) => (a.match.index ?? 0) - (b.match.index ?? 0));
+    const { match: picked, kind } = candidates[0]!;
+
+    // Extract inner locator based on balanced parens — start sits right after the opening `(`.
+    const start = picked.index! + picked[0].length;
     let balance = 0;
     let end = start;
     for (; end < template.length; end++) {
@@ -129,13 +141,34 @@ function transform(template: string, params: TemplateParams, testIdAttributeName
       if (balance < 0) break;
     }
 
-    // Replace Java sethas(...) and sethasnot(...) with has=... and hasnot=...
     let prefix = template.substring(0, start);
     let extraSymbol = 0;
-    if (["sethas(", "sethasnot("].includes(hasMatch[1])) {
-      // Eat extra ) symbol at the end of sethas(...)
-      extraSymbol = 1;
-      prefix = prefix.replace(/sethas\($/, "has=").replace(/sethasnot\($/, "hasnot=");
+
+    if (kind === "and-or") {
+      // `.and(inner)` → `.filter(and2=$N)`; `.or(inner)` → `.filter(or2=$N)` so the inner
+      // selector flows through the final transform rules below. Prefix already ends with the
+      // swapped marker, so we skip the filter-has marker swap.
+      const op = picked[1]!; // "and" | "or"
+      prefix = template.substring(0, picked.index!) + `.filter(${op}2=`;
+    } else if (kind === "locator-has") {
+      // `locator(sel, has=inner)` → `locator(sel).filter(has2=$N)`. The original `locator(sel,…`
+      // prefix already includes `locator(sel,` plus `has=|hasnot=|sethas(|sethasnot(`; we
+      // rewrite it into `locator(sel).filter(<marker>=` so the existing `locator(x)` unwrap
+      // rule handles the outer locator.
+      const commaIndex = prefix.lastIndexOf(",");
+      const inner = prefix.substring(commaIndex + 1);
+      let markedInner = inner.replace(/=$/, "2=");
+      if (["sethas(", "sethasnot("].includes(picked[1]!)) {
+        extraSymbol = 1;
+        markedInner = markedInner.replace(/sethas\($/, "has2=").replace(/sethasnot\($/, "hasnot2=");
+      }
+      prefix = prefix.substring(0, commaIndex) + `).filter(${markedInner}`;
+    } else {
+      // Existing filter(has=…) / filter(sethas(...)) handling.
+      if (["sethas(", "sethasnot("].includes(picked[1]!)) {
+        extraSymbol = 1;
+        prefix = prefix.replace(/sethas\($/, "has=").replace(/sethasnot\($/, "hasnot=");
+      }
     }
 
     const paramsCountBeforeHas = countParams(template.substring(0, start));
@@ -144,14 +177,15 @@ function transform(template: string, params: TemplateParams, testIdAttributeName
     const hasParams = params.slice(paramsCountBeforeHas, paramsCountBeforeHas + paramsCountInHas);
     const hasSelector = JSON.stringify(transform(hasTemplate, hasParams, testIdAttributeName));
 
-    // Replace filter(has=...) with filter(has2=$5). Use has2 to avoid matching the same filter again.
-    // Replace filter(hasnot=...) with filter(hasnot2=$5). Use hasnot2 to avoid matching the same filter again.
+    // Only filter-has still has the raw `has=|hasnot=` marker on the prefix — swap it to `2=`.
+    if (kind === "filter-has") {
+      prefix = prefix.replace(/=$/, "2=");
+    }
     template =
-      prefix.replace(/=$/, "2=") +
+      prefix +
       `$${paramsCountBeforeHas + 1}` +
       shiftParams(template.substring(end + extraSymbol), paramsCountInHas - 1);
 
-    // Replace inner params with $5 value.
     const paramsBeforeHas = params.slice(0, paramsCountBeforeHas);
     const paramsAfterHas = params.slice(paramsCountBeforeHas + paramsCountInHas);
     params = paramsBeforeHas.concat([{ quote: '"', text: hasSelector }]).concat(paramsAfterHas);
@@ -183,6 +217,8 @@ function transform(template: string, params: TemplateParams, testIdAttributeName
     .replace(/filter\(,?hasnottext=([^)]+)\)/g, "internal:has-not-text=$1")
     .replace(/filter\(,?has2=([^)]+)\)/g, "internal:has=$1")
     .replace(/filter\(,?hasnot2=([^)]+)\)/g, "internal:has-not=$1")
+    .replace(/filter\(,?and2=([^)]+)\)/g, "internal:and=$1")
+    .replace(/filter\(,?or2=([^)]+)\)/g, "internal:or=$1")
     .replace(/,exact=false/g, "")
     .replace(/,exact=true/g, "s")
     .replace(/,includehidden=/g, ",include-hidden=")
@@ -221,7 +257,13 @@ function transform(template: string, params: TemplateParams, testIdAttributeName
         })
         .replace(/\$(\d+)(i|s)?/g, (_, ordinal, suffix) => {
           const param = params[+ordinal - 1];
-          if (t.startsWith("internal:has=") || t.startsWith("internal:has-not=")) return param.text;
+          if (
+            t.startsWith("internal:has=") ||
+            t.startsWith("internal:has-not=") ||
+            t.startsWith("internal:and=") ||
+            t.startsWith("internal:or=")
+          )
+            return param.text;
           if (t.startsWith("internal:testid")) return escapeForAttributeSelector(param.text, true);
           if (t.startsWith("internal:attr") || t.startsWith("internal:role"))
             return escapeForAttributeSelector(param.text, suffix === "s");

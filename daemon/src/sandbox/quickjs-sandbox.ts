@@ -4,7 +4,9 @@ import util from "node:util";
 import type { Page } from "playwright";
 
 import type { BrowserManager } from "../browser-manager.js";
+import * as AgentManager from "../agent-manager.js";
 import * as AuditManager from "../audit-manager.js";
+import * as AuthFlowManager from "../auth-flow-manager.js";
 import * as CookieManager from "../cookie-manager.js";
 import * as ErrorCollector from "../error-collector.js";
 import * as FormManager from "../form-manager.js";
@@ -268,6 +270,17 @@ export class QuickJSSandbox {
           auditAccessibility: (pageName, options) => this.#auditPage("accessibility", pageName, options),
           auditPerformance: (pageName, options) => this.#auditPage("performance", pageName, options),
           auditFull: (pageName, options) => this.#auditPage("full", pageName, options),
+          auditMixedContent: (pageName, options) =>
+            this.#auditMixedContent(pageName, options),
+          auditAuth: (pageName, options) => this.#auditAuth(pageName, options),
+          agentSummarize: (pageName, options) => this.#agentSummarize(pageName, options),
+          agentStableSelector: (pageName, target) =>
+            this.#agentStableSelector(pageName, target),
+          agentActIntent: (pageName, intent, options) =>
+            this.#agentActIntent(pageName, intent, options),
+          authFlowsDetect: () => this.#authFlowsDetect(),
+          authFlowsReplay: (flowId, mutations) =>
+            this.#authFlowsReplay(flowId, mutations),
         },
         onConsole: (level, args) => {
           this.#routeConsole(level, args);
@@ -969,6 +982,18 @@ export class QuickJSSandbox {
                   },
                   enumerable: true,
                 },
+                mixedContent: {
+                  value: async (pageName, options) => {
+                    return await hostCall("auditMixedContent", JSON.stringify([pageName, options ?? {}]));
+                  },
+                  enumerable: true,
+                },
+                auth: {
+                  value: async (pageName, options) => {
+                    return await hostCall("auditAuth", JSON.stringify([pageName, options ?? {}]));
+                  },
+                  enumerable: true,
+                },
               }));
               Object.defineProperty(globalThis, "audit", {
                 value: auditApi,
@@ -1082,9 +1107,83 @@ export class QuickJSSandbox {
                   },
                   enumerable: true,
                 },
+                detectAuthFlows: {
+                  value: async () => {
+                    return await hostCall("authFlowsDetect", JSON.stringify([]));
+                  },
+                  enumerable: true,
+                },
+                replayAuthFlow: {
+                  value: async (flowId, mutations) => {
+                    return await hostCall(
+                      "authFlowsReplay",
+                      JSON.stringify([flowId, mutations ?? {}]),
+                    );
+                  },
+                  enumerable: true,
+                },
               }));
               Object.defineProperty(globalThis, "security", {
                 value: securityApi,
+                configurable: false,
+                enumerable: true,
+                writable: false,
+              });
+
+              // --- agent API (LLM-friendly helpers) ---
+              const agentApi = Object.freeze(Object.create(null, {
+                summarize: {
+                  value: async (pageOrName, options) => {
+                    const name = typeof pageOrName === "string"
+                      ? pageOrName
+                      : (pageOrName && typeof pageOrName._pageName === "string"
+                          ? pageOrName._pageName
+                          : null);
+                    if (!name) {
+                      throw new TypeError(
+                        "agent.summarize: first argument must be a page name string",
+                      );
+                    }
+                    return await hostCall(
+                      "agentSummarize",
+                      JSON.stringify([name, options ?? {}]),
+                    );
+                  },
+                  enumerable: true,
+                },
+                stableSelector: {
+                  value: async (pageOrName, target) => {
+                    const name = typeof pageOrName === "string" ? pageOrName : null;
+                    if (!name) {
+                      throw new TypeError(
+                        "agent.stableSelector: first argument must be a page name string",
+                      );
+                    }
+                    return await hostCall(
+                      "agentStableSelector",
+                      JSON.stringify([name, target]),
+                    );
+                  },
+                  enumerable: true,
+                },
+                actIntent: {
+                  value: async (pageOrName, intent, options) => {
+                    const name = typeof pageOrName === "string" ? pageOrName : null;
+                    if (!name) {
+                      throw new TypeError(
+                        "agent.actIntent: first argument must be a page name string",
+                      );
+                    }
+                    return await hostCall(
+                      "agentActIntent",
+                      JSON.stringify([name, intent, options ?? {}]),
+                    );
+                  },
+                  enumerable: true,
+                },
+              }));
+              Object.defineProperty(globalThis, "agent", {
+                value: agentApi,
                 configurable: false,
                 enumerable: true,
                 writable: false,
@@ -1516,6 +1615,57 @@ export class QuickJSSandbox {
     const logEntry = this.#requireLogEntry(index);
     const cfg = (config && typeof config === "object" ? config : {}) as FuzzingManager.FuzzConfig;
     return FuzzingManager.fuzzRequest(entry.context, logEntry, cfg);
+  }
+
+  async #agentSummarize(pageName: unknown, options: unknown): Promise<unknown> {
+    const { page } = this.#requireNamedPage(pageName);
+    const opts = (options && typeof options === "object" ? options : {}) as AgentManager.SummarizeOptions;
+    return AgentManager.summarizePage(page, opts);
+  }
+
+  async #agentStableSelector(pageName: unknown, target: unknown): Promise<unknown> {
+    const { page } = this.#requireNamedPage(pageName);
+    const sel = requireString(target, "Selector target");
+    return AgentManager.resolveStableSelector(page, sel);
+  }
+
+  async #agentActIntent(
+    pageName: unknown,
+    intent: unknown,
+    options: unknown
+  ): Promise<unknown> {
+    const { page } = this.#requireNamedPage(pageName);
+    const intentStr = requireString(intent, "Intent");
+    const opts = (options && typeof options === "object" ? options : {}) as AgentManager.ActIntentOptions;
+    return AgentManager.actIntent(page, intentStr, opts);
+  }
+
+  async #auditMixedContent(pageName: unknown, options: unknown): Promise<unknown> {
+    const { page } = this.#requireNamedPage(pageName);
+    const opts = (options && typeof options === "object" ? options : {}) as AuditManager.MixedContentOptions;
+    const log = this.#networkManager?.getLog() ?? [];
+    return AuditManager.auditMixedContent(page, log, opts);
+  }
+
+  async #auditAuth(pageName: unknown, options: unknown): Promise<unknown> {
+    const { entry, page } = this.#requireNamedPage(pageName);
+    const opts = (options && typeof options === "object" ? options : {}) as AuditManager.AuthAuditOptions;
+    return AuditManager.auditAuth(entry.context, page, opts);
+  }
+
+  #authFlowsDetect(): unknown {
+    const log = this.#networkManager?.getLog() ?? [];
+    return AuthFlowManager.detectAuthFlows(log);
+  }
+
+  async #authFlowsReplay(flowId: unknown, mutations: unknown): Promise<unknown> {
+    const entry = this.#requireContext();
+    const log = this.#networkManager?.getLog() ?? [];
+    const id = requireString(flowId, "Auth flow id");
+    const muts = (mutations && typeof mutations === "object"
+      ? mutations
+      : {}) as AuthFlowManager.AuthReplayMutations;
+    return AuthFlowManager.replayAuthFlow(entry.context, log, id, muts);
   }
 
   async #cleanupAnonymousPages(options: { suppressErrors?: boolean } = {}): Promise<void> {
