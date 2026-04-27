@@ -7,6 +7,7 @@ import type { BrowserManager } from "../browser-manager.js";
 import * as AgentManager from "../agent-manager.js";
 import * as AuditManager from "../audit-manager.js";
 import * as AuthFlowManager from "../auth-flow-manager.js";
+import * as CloudflareManager from "../cloudflare-manager.js";
 import * as CookieManager from "../cookie-manager.js";
 import * as ErrorCollector from "../error-collector.js";
 import * as FormManager from "../form-manager.js";
@@ -281,6 +282,14 @@ export class QuickJSSandbox {
           authFlowsDetect: () => this.#authFlowsDetect(),
           authFlowsReplay: (flowId, mutations) =>
             this.#authFlowsReplay(flowId, mutations),
+          cloudflareDetect: (pageName) => this.#cloudflareDetect(pageName),
+          cloudflareWaitForPass: (pageName, options) =>
+            this.#cloudflareWaitForPass(pageName, options),
+          cloudflareWaitForSolve: (pageName, options) =>
+            this.#cloudflareWaitForSolve(pageName, options),
+          cloudflareSaveClearance: (domain) => this.#cloudflareSaveClearance(domain),
+          cloudflareRestoreClearance: (domain) => this.#cloudflareRestoreClearance(domain),
+          cloudflareStealthArgs: (options) => this.#cloudflareStealthArgs(options),
         },
         onConsole: (level, args) => {
           this.#routeConsole(level, args);
@@ -1189,6 +1198,64 @@ export class QuickJSSandbox {
                 writable: false,
               });
 
+              // --- cloudflare API (challenge detection / bypass helpers) ---
+              const cloudflareApi = Object.freeze(Object.create(null, {
+                detect: {
+                  value: async (pageName) => {
+                    return await hostCall("cloudflareDetect", JSON.stringify([pageName]));
+                  },
+                  enumerable: true,
+                },
+                waitForPass: {
+                  value: async (pageName, options) => {
+                    return await hostCall(
+                      "cloudflareWaitForPass",
+                      JSON.stringify([pageName, options ?? {}]),
+                    );
+                  },
+                  enumerable: true,
+                },
+                waitForSolve: {
+                  value: async (pageName, options) => {
+                    return await hostCall(
+                      "cloudflareWaitForSolve",
+                      JSON.stringify([pageName, options ?? {}]),
+                    );
+                  },
+                  enumerable: true,
+                },
+                saveClearance: {
+                  value: async (domain) => {
+                    return await hostCall("cloudflareSaveClearance", JSON.stringify([domain]));
+                  },
+                  enumerable: true,
+                },
+                restoreClearance: {
+                  value: async (domain) => {
+                    return await hostCall(
+                      "cloudflareRestoreClearance",
+                      JSON.stringify([domain]),
+                    );
+                  },
+                  enumerable: true,
+                },
+                stealthArgs: {
+                  value: async (options) => {
+                    return await hostCall(
+                      "cloudflareStealthArgs",
+                      JSON.stringify([options ?? {}]),
+                    );
+                  },
+                  enumerable: true,
+                },
+              }));
+              Object.defineProperty(globalThis, "cloudflare", {
+                value: cloudflareApi,
+                configurable: false,
+                enumerable: true,
+                writable: false,
+              });
+
               // --- scenario API (pure-sandbox orchestration helpers) ---
               const scenarioApi = (() => {
                 function parallel(fns) {
@@ -1666,6 +1733,49 @@ export class QuickJSSandbox {
       ? mutations
       : {}) as AuthFlowManager.AuthReplayMutations;
     return AuthFlowManager.replayAuthFlow(entry.context, log, id, muts);
+  }
+
+  async #cloudflareDetect(pageName: unknown): Promise<unknown> {
+    const { page } = this.#requireNamedPage(pageName);
+    const log = this.#networkManager?.getLog() ?? [];
+    return CloudflareManager.detectState(page, { networkLog: log });
+  }
+
+  async #cloudflareWaitForPass(pageName: unknown, options: unknown): Promise<unknown> {
+    const { page } = this.#requireNamedPage(pageName);
+    const log = this.#networkManager?.getLog() ?? [];
+    const opts = (options && typeof options === "object"
+      ? options
+      : {}) as CloudflareManager.WaitForPassOptions;
+    return CloudflareManager.waitForPass(page, { ...opts, networkLog: log });
+  }
+
+  async #cloudflareWaitForSolve(pageName: unknown, options: unknown): Promise<unknown> {
+    const { page } = this.#requireNamedPage(pageName);
+    const log = this.#networkManager?.getLog() ?? [];
+    const opts = (options && typeof options === "object"
+      ? options
+      : {}) as CloudflareManager.WaitForSolveOptions;
+    return CloudflareManager.waitForSolve(page, { ...opts, networkLog: log });
+  }
+
+  async #cloudflareSaveClearance(domain: unknown): Promise<unknown> {
+    const entry = this.#requireContext();
+    const d = requireString(domain, "Cloudflare clearance domain");
+    return CloudflareManager.saveClearance(entry.context, d);
+  }
+
+  async #cloudflareRestoreClearance(domain: unknown): Promise<unknown> {
+    const entry = this.#requireContext();
+    const d = requireString(domain, "Cloudflare clearance domain");
+    return CloudflareManager.restoreClearance(entry.context, d);
+  }
+
+  #cloudflareStealthArgs(options: unknown): unknown {
+    const opts = (options && typeof options === "object"
+      ? options
+      : {}) as CloudflareManager.StealthLaunchOptions;
+    return CloudflareManager.stealthLaunchArgs(opts);
   }
 
   async #cleanupAnonymousPages(options: { suppressErrors?: boolean } = {}): Promise<void> {
