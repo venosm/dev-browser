@@ -3,6 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
 
+import { stealthLaunchArgs } from "./cloudflare-manager.js";
+
 export interface BrowserEntry {
   name: string;
   type: "launched" | "connected";
@@ -14,6 +16,7 @@ export interface BrowserEntry {
   headless: boolean;
   ignoreHTTPSErrors: boolean;
   proxy?: string;
+  stealth?: boolean;
 }
 
 interface BrowserSummary {
@@ -94,6 +97,7 @@ export class BrowserManager {
       headless?: boolean;
       ignoreHTTPSErrors?: boolean;
       proxy?: string;
+      stealth?: boolean;
     } = {}
   ): Promise<BrowserEntry> {
     await this.ensureBaseDir();
@@ -102,6 +106,7 @@ export class BrowserManager {
     const requestedIgnoreHTTPSErrors =
       options.ignoreHTTPSErrors ?? existing?.ignoreHTTPSErrors ?? false;
     const requestedProxy = options.proxy ?? existing?.proxy;
+    const requestedStealth = options.stealth ?? existing?.stealth ?? false;
 
     if (existing) {
       const needsRelaunch =
@@ -110,7 +115,8 @@ export class BrowserManager {
         (options.headless !== undefined && existing.headless !== requestedHeadless) ||
         (options.ignoreHTTPSErrors !== undefined &&
           existing.ignoreHTTPSErrors !== requestedIgnoreHTTPSErrors) ||
-        (options.proxy !== undefined && existing.proxy !== requestedProxy);
+        (options.proxy !== undefined && existing.proxy !== requestedProxy) ||
+        (options.stealth !== undefined && (existing.stealth ?? false) !== requestedStealth);
 
       if (!needsRelaunch) {
         return existing;
@@ -119,7 +125,13 @@ export class BrowserManager {
       await this.stopBrowser(name);
     }
 
-    return this.launchBrowser(name, requestedHeadless, requestedIgnoreHTTPSErrors, requestedProxy);
+    return this.launchBrowser(
+      name,
+      requestedHeadless,
+      requestedIgnoreHTTPSErrors,
+      requestedProxy,
+      requestedStealth,
+    );
   }
 
   async autoConnect(name: string): Promise<BrowserEntry> {
@@ -354,7 +366,8 @@ export class BrowserManager {
     name: string,
     headless: boolean,
     ignoreHTTPSErrors: boolean,
-    proxy?: string
+    proxy?: string,
+    stealth: boolean = false,
   ): Promise<BrowserEntry> {
     const profileDir = path.join(this.baseDir, name, "chromium-profile");
     await this.dependencies.mkdir(profileDir, { recursive: true });
@@ -368,6 +381,11 @@ export class BrowserManager {
     };
     if (proxy) {
       launchOptions.proxy = { server: proxy };
+    }
+    if (stealth) {
+      const stealthArgs = stealthLaunchArgs({ newHeadless: headless });
+      launchOptions.args = [...(launchOptions.args ?? []), ...stealthArgs.args];
+      launchOptions.userAgent = stealthArgs.userAgent;
     }
 
     const context = await this.dependencies.launchPersistentContext(profileDir, launchOptions);
@@ -388,6 +406,7 @@ export class BrowserManager {
       headless,
       ignoreHTTPSErrors,
       proxy,
+      stealth,
     };
 
     this.attachBrowserLifecycle(entry);
