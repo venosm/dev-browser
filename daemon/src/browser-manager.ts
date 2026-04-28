@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
 
-import { stealthLaunchArgs } from "./cloudflare-manager.js";
+import { stealthInitScript, stealthLaunchArgs } from "./cloudflare-manager.js";
 
 export interface BrowserEntry {
   name: string;
@@ -386,9 +386,17 @@ export class BrowserManager {
       const stealthArgs = stealthLaunchArgs({ newHeadless: headless });
       launchOptions.args = [...(launchOptions.args ?? []), ...stealthArgs.args];
       launchOptions.userAgent = stealthArgs.userAgent;
+      launchOptions.viewport = launchOptions.viewport ?? { width: 1280, height: 720 };
     }
 
     const context = await this.dependencies.launchPersistentContext(profileDir, launchOptions);
+    if (stealth) {
+      try {
+        await context.addInitScript({ content: stealthInitScript() });
+      } catch {
+        // Init scripts are best-effort — continue if Playwright rejects.
+      }
+    }
     const browser = context.browser();
 
     if (!browser) {

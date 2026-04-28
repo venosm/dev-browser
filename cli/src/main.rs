@@ -137,6 +137,13 @@ struct Cli {
 
     #[arg(
         long,
+        help = "Apply stealth flags + init scripts to evade bot detection (e.g. Cloudflare)",
+        long_help = "Launch daemon-managed Chromium with stealth flags and init scripts applied.\n\nDisables AutomationControlled, sets a realistic Windows Chrome user agent, hides navigator.webdriver, populates plugins/mimeTypes, stubs window.chrome.runtime, and patches permissions.query — covering the same evasions as playwright-stealth.\n\nUse with --headless=false (the default) so you can solve any human-only Cloudflare Turnstile challenges manually.\n\nThis only affects daemon-launched browsers. It has no effect when `--connect` attaches to an already-running external browser."
+    )]
+    stealth: bool,
+
+    #[arg(
+        long,
         help = "Ignore HTTPS certificate errors for daemon-managed Chromium",
         long_help = "Launch or relaunch daemon-managed Chromium with HTTPS certificate errors ignored.\n\nThis is useful for self-signed certificates in local or staging environments. The setting applies per managed browser session until the daemon restarts or the setting changes and triggers a relaunch.\n\nThis only affects daemon-launched browsers. It has no effect when `--connect` attaches to an already-running external browser."
     )]
@@ -348,6 +355,10 @@ fn run_script(cli: &Cli, script: String) -> Result<i32, Box<dyn Error>> {
 
     if cli.headless {
         request["headless"] = Value::Bool(true);
+    }
+
+    if cli.stealth {
+        request["stealth"] = Value::Bool(true);
     }
 
     if cli.ignore_https_errors {
