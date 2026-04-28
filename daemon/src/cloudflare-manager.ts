@@ -364,7 +364,7 @@ export interface StealthLaunchOptions {
 }
 
 const DEFAULT_STEALTH_UA =
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.182 Safari/537.36";
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.182 Safari/537.36";
 
 export function stealthLaunchArgs(options: StealthLaunchOptions = {}): {
   args: string[];
@@ -387,4 +387,109 @@ export function stealthLaunchArgs(options: StealthLaunchOptions = {}): {
     args,
     userAgent: options.userAgent ?? DEFAULT_STEALTH_UA,
   };
+}
+
+/**
+ * Page-side init script that mirrors the core evasions from `playwright-stealth`:
+ *   - hides `navigator.webdriver`
+ *   - populates `navigator.plugins` and `navigator.mimeTypes`
+ *   - sets a realistic `navigator.languages`
+ *   - stubs `window.chrome.runtime`
+ *   - patches `permissions.query` to behave like a real Chrome (notifications)
+ *   - rewrites WebGL UNMASKED_VENDOR/RENDERER strings
+ *
+ * Apply with `context.addInitScript(stealthInitScript())` so it runs before any
+ * page JS executes — including Cloudflare's Turnstile fingerprint script.
+ */
+export function stealthInitScript(): string {
+  return `
+    (() => {
+      try {
+        Object.defineProperty(Navigator.prototype, "webdriver", {
+          get: () => undefined,
+          configurable: true,
+        });
+      } catch {}
+
+      try {
+        const fakePlugin = (name, filename, description) => ({
+          name,
+          filename,
+          description,
+          length: 1,
+          item: () => null,
+          namedItem: () => null,
+        });
+        const plugins = [
+          fakePlugin("Chrome PDF Plugin", "internal-pdf-viewer", "Portable Document Format"),
+          fakePlugin("Chrome PDF Viewer", "mhjfbmdgcfjbbpaeojofohoefgiehjai", ""),
+          fakePlugin("Native Client", "internal-nacl-plugin", ""),
+        ];
+        Object.defineProperty(Navigator.prototype, "plugins", {
+          get: () => plugins,
+          configurable: true,
+        });
+        Object.defineProperty(Navigator.prototype, "mimeTypes", {
+          get: () => [{ type: "application/pdf", suffixes: "pdf", description: "PDF" }],
+          configurable: true,
+        });
+      } catch {}
+
+      try {
+        Object.defineProperty(Navigator.prototype, "languages", {
+          get: () => ["en-US", "en"],
+          configurable: true,
+        });
+      } catch {}
+
+      try {
+        if (!window.chrome) {
+          window.chrome = {};
+        }
+        if (!window.chrome.runtime) {
+          window.chrome.runtime = {
+            PlatformOs: { MAC: "mac", WIN: "win", LINUX: "linux" },
+            connect: () => {},
+            sendMessage: () => {},
+          };
+        }
+      } catch {}
+
+      try {
+        const origQuery = Navigator.prototype.permissions
+          ? null
+          : null;
+        if (navigator.permissions && navigator.permissions.query) {
+          const realQuery = navigator.permissions.query.bind(navigator.permissions);
+          navigator.permissions.query = (parameters) => {
+            if (parameters && parameters.name === "notifications") {
+              return Promise.resolve({ state: Notification.permission, onchange: null });
+            }
+            return realQuery(parameters);
+          };
+        }
+        void origQuery;
+      } catch {}
+
+      try {
+        const getParameter = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function (parameter) {
+          if (parameter === 37445) return "Intel Inc.";
+          if (parameter === 37446) return "Intel Iris OpenGL Engine";
+          return getParameter.call(this, parameter);
+        };
+      } catch {}
+
+      try {
+        Object.defineProperty(Navigator.prototype, "hardwareConcurrency", {
+          get: () => 8,
+          configurable: true,
+        });
+        Object.defineProperty(Navigator.prototype, "deviceMemory", {
+          get: () => 8,
+          configurable: true,
+        });
+      } catch {}
+    })();
+  `;
 }
